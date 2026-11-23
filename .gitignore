@@ -1,0 +1,9 @@
+build/
+third_party/alicekit/fonts/packed/font_atlas.hpp
+third_party/alicekit/fonts/packed/font_data.hpp
+.DS_Store
+*.o
+*.dll
+*.exe
+*.bin
+*.log
