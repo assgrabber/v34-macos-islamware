@@ -635,11 +635,13 @@ char const* WeaponGlyph(char const* name) {
 }
 
 ImFont* IconFont() {
+    if (!alice::core || !alice::core->fonts) return nullptr;
     auto& iconf = alice::core->fonts->get("undefeated");
     return iconf.ptr;
 }
 
 float IconFontSize() {
+    if (!alice::core || !alice::core->fonts) return 14.f;
     auto& iconf = alice::core->fonts->get("undefeated");
     return iconf.size;
 }
@@ -732,64 +734,64 @@ void box_render(ImDrawList* dl, const ImRect& bounds, Side, ImVec2, float alpha,
 ImVec2 kit_measure(const ImRect&, Side, float, void* user, float scale) {
     PlayerView const* v = static_cast<PlayerView const*>(user);
     if (!v || !v->kit_icon) return { 0.f, 0.f };
-    auto& iconf = alice::core->fonts->get("undefeated");
-    if (!iconf.ptr) return { 0.f, 0.f };
-    float const fs = ScaledFont(iconf.size, scale);
-    ImVec2 const ts = iconf.ptr->CalcTextSizeA(fs, FLT_MAX, 0, "r");
+    ImFont* f = IconFont();
+    if (!f) return { 0.f, 0.f };
+    float const fs = ScaledFont(IconFontSize(), scale);
+    ImVec2 const ts = f->CalcTextSizeA(fs, FLT_MAX, 0, "r");
     return { ts.x, ts.y };
 }
 
 void kit_render(ImDrawList* dl, const ImRect&, Side, ImVec2 pos, float alpha, float vis_alpha, void* user, float scale) {
     PlayerView const* v = static_cast<PlayerView const*>(user);
     if (!v || !v->kit_icon) return;
-    auto& iconf = alice::core->fonts->get("undefeated");
-    if (!iconf.ptr) return;
-    float const fs = ScaledFont(iconf.size, scale);
+    ImFont* f = IconFont();
+    if (!f) return;
+    float const fs = ScaledFont(IconFontSize(), scale);
     ImU32 const col = Col(cfg.esp_kit_icon_color, alpha * vis_alpha, v->gray, v->gray_amt);
-    dl->AddText(iconf.ptr, fs, ImVec2(pos.x + 1, pos.y + 1), IM_COL32(0, 0, 0, (int)(150 * alpha)), "r");
-    dl->AddText(iconf.ptr, fs, pos, col, "r");
+    dl->AddText(f, fs, ImVec2(pos.x + 1, pos.y + 1), IM_COL32(0, 0, 0, (int)(150 * alpha)), "r");
+    dl->AddText(f, fs, pos, col, "r");
 }
 
 ImVec2 c4icon_measure(const ImRect&, Side, float, void* user, float scale) {
     PlayerView const* v = static_cast<PlayerView const*>(user);
     if (!v || !v->c4_icon) return { 0.f, 0.f };
-    auto& iconf = alice::core->fonts->get("undefeated");
-    if (!iconf.ptr) return { 0.f, 0.f };
-    float const fs = ScaledFont(iconf.size, scale);
-    ImVec2 const ts = iconf.ptr->CalcTextSizeA(fs, FLT_MAX, 0, "o");
+    ImFont* f = IconFont();
+    if (!f) return { 0.f, 0.f };
+    float const fs = ScaledFont(IconFontSize(), scale);
+    ImVec2 const ts = f->CalcTextSizeA(fs, FLT_MAX, 0, "o");
     return { ts.x, ts.y };
 }
 
 void c4icon_render(ImDrawList* dl, const ImRect&, Side, ImVec2 pos, float alpha, float vis_alpha, void* user, float scale) {
     PlayerView const* v = static_cast<PlayerView const*>(user);
     if (!v || !v->c4_icon) return;
-    auto& iconf = alice::core->fonts->get("undefeated");
-    if (!iconf.ptr) return;
-    float const fs = ScaledFont(iconf.size, scale);
+    ImFont* f = IconFont();
+    if (!f) return;
+    float const fs = ScaledFont(IconFontSize(), scale);
     ImU32 const col = Col(cfg.esp_c4_icon_color, alpha * vis_alpha, v->gray, v->gray_amt);
-    dl->AddText(iconf.ptr, fs, ImVec2(pos.x + 1, pos.y + 1), IM_COL32(0, 0, 0, (int)(150 * alpha)), "o");
-    dl->AddText(iconf.ptr, fs, pos, col, "o");
+    dl->AddText(f, fs, ImVec2(pos.x + 1, pos.y + 1), IM_COL32(0, 0, 0, (int)(150 * alpha)), "o");
+    dl->AddText(f, fs, pos, col, "o");
 }
 
 ImVec2 taser_measure(const ImRect&, Side, float, void* user, float scale) {
     PlayerView const* v = static_cast<PlayerView const*>(user);
     if (!v || !v->taser_icon) return { 0.f, 0.f };
-    auto& iconf = alice::core->fonts->get("undefeated");
-    if (!iconf.ptr) return { 0.f, 0.f };
-    float const fs = ScaledFont(iconf.size, scale);
-    ImVec2 const ts = iconf.ptr->CalcTextSizeA(fs, FLT_MAX, 0, "h");
+    ImFont* f = IconFont();
+    if (!f) return { 0.f, 0.f };
+    float const fs = ScaledFont(IconFontSize(), scale);
+    ImVec2 const ts = f->CalcTextSizeA(fs, FLT_MAX, 0, "h");
     return { ts.x, ts.y };
 }
 
 void taser_render(ImDrawList* dl, const ImRect&, Side, ImVec2 pos, float alpha, float vis_alpha, void* user, float scale) {
     PlayerView const* v = static_cast<PlayerView const*>(user);
     if (!v || !v->taser_icon) return;
-    auto& iconf = alice::core->fonts->get("undefeated");
-    if (!iconf.ptr) return;
-    float const fs = ScaledFont(iconf.size, scale);
+    ImFont* f = IconFont();
+    if (!f) return;
+    float const fs = ScaledFont(IconFontSize(), scale);
     ImU32 const col = Col(cfg.esp_taser_icon_color, alpha * vis_alpha, v->gray, v->gray_amt);
-    dl->AddText(iconf.ptr, fs, ImVec2(pos.x + 1, pos.y + 1), IM_COL32(0, 0, 0, (int)(150 * alpha)), "h");
-    dl->AddText(iconf.ptr, fs, pos, col, "h");
+    dl->AddText(f, fs, ImVec2(pos.x + 1, pos.y + 1), IM_COL32(0, 0, 0, (int)(150 * alpha)), "h");
+    dl->AddText(f, fs, pos, col, "h");
 }
 
 // ---------------------------------------------------------------- flags

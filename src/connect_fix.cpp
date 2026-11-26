@@ -177,12 +177,17 @@ static int PatchAllModules(bool enable) {
 }
 
 void SetConnectFix(bool enable) {
+#ifndef _WIN64
+    (void)enable;
+    return;
+#else
     InterlockedExchange(&fix_enabled, enable ? 1 : 0);
     HMODULE eng = GetModuleHandleA("engine.dll");
     if (eng) PatchEngineSnsAccessors(eng, enable);
     if (!real_find_ui) return;   // loader thread has not resolved the exports yet
     int n = PatchAllModules(enable);
     Log("[connectfix] %s, %d import slots rewritten", enable ? "enabled" : "disabled", n);
+#endif
 }
 
 static DWORD WINAPI ConnectFixThread(LPVOID) {
@@ -377,6 +382,10 @@ void SetVersionSpoof(bool enable) {
 }
 
 void StartConnectFix() {
+#ifndef _WIN64
+    InterlockedExchange(&fix_enabled, 0);
+    return;
+#else
     if (!cfg.connect_fix) {
         InterlockedExchange(&fix_enabled, 0);
         Log("[connectfix] disabled in settings");
@@ -384,9 +393,14 @@ void StartConnectFix() {
     }
     HANDLE h = CreateThread(nullptr, 0, ConnectFixThread, nullptr, 0, nullptr);
     if (h) CloseHandle(h);
+#endif
 }
 
 void ConnectFixStatus(char* buf, int buf_size) {
+#ifndef _WIN64
+    snprintf(buf, buf_size, "v34 direct UDP (not needed)");
+#else
     snprintf(buf, buf_size, fix_enabled ? "SNS disabled — direct UDP connect active"
                                         : "SNS enabled (game update mode)");
+#endif
 }

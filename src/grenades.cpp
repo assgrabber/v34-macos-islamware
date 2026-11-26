@@ -71,9 +71,9 @@ static DWORD g_live_scan = 0;
 const char* NetworkClassName(int index) {
     void* nw = entity_list.GetClientNetworkable(index);
     if (!nw) return nullptr;
-    void* cc = VFunc<void*(__fastcall*)(void*)>(nw, 2)(nw);
+    void* cc = VFunc<void*(THISCALL_CC*)(void*)>(nw, 2)(nw);
     if (!cc) return nullptr;
-    const char* name = *reinterpret_cast<const char**>((char*)cc + 0x10);
+    const char* name = ClientClassName(cc);
     return name;
 }
 

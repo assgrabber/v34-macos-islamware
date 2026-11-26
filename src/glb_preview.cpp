@@ -300,6 +300,17 @@ void Load() {
             v[2] = (v[2] - cz) * inv;
         }
     }
+
+    // Decimate heavy meshes once on load so the preview pane never stalls FPS
+    constexpr size_t kMaxPreviewTris = 1200;
+    if (g_tris.size() > kMaxPreviewTris) {
+        std::vector<Tri> decimated;
+        decimated.reserve(kMaxPreviewTris);
+        double const step = (double)g_tris.size() / (double)kMaxPreviewTris;
+        for (size_t i = 0; i < kMaxPreviewTris; i++)
+            decimated.push_back(g_tris[(size_t)(i * step)]);
+        g_tris.swap(decimated);
+    }
 }
 
 struct ProjTri {
@@ -318,81 +329,94 @@ void Draw(ImDrawList* dl, ImVec2 center, float size) {
         return;
 
     static float yaw = 0.4f;
-    yaw += ImGui::GetIO().DeltaTime * 0.5f;
+    static std::vector<ProjTri> cached_out;
+    static DWORD last_rebuild = 0;
+    static ImVec2 last_center{ -1e9f, -1e9f };
+    static float last_size = -1.f;
 
-    float const cy = cosf(yaw);
-    float const sy = sinf(yaw);
-    float const pitch = -0.18f;
-    float const cp = cosf(pitch);
-    float const sp = sinf(pitch);
+    DWORD const now = GetTickCount();
+    bool const moved = fabsf(center.x - last_center.x) > 0.5f ||
+                       fabsf(center.y - last_center.y) > 0.5f ||
+                       fabsf(size - last_size) > 0.5f;
 
-    float const scale = size * 0.5f;
-    float const f = 3.0f;
-    float const lx = 0.36f, ly = 0.75f, lz = 0.55f;
+    if (moved || cached_out.empty() || now - last_rebuild >= 50) {
+        if (last_rebuild != 0)
+            yaw += (float)(now - last_rebuild) * 0.0005f;
+        last_rebuild = now;
+        last_center = center;
+        last_size = size;
 
-    std::vector<ProjTri> out;
-    out.reserve(g_tris.size());
+        float const cy = cosf(yaw);
+        float const sy = sinf(yaw);
+        float const pitch = -0.18f;
+        float const cp = cosf(pitch);
+        float const sp = sinf(pitch);
 
-    for (auto const& t : g_tris) {
-        float const* verts[3] = { t.a, t.b, t.c };
-        float rv[3][3];
-        ProjTri pt{};
-        float depth = 0.f;
-        bool behind = false;
-        for (int k = 0; k < 3; k++) {
-            float const* v = verts[k];
-            // yaw about Y
-            float x = v[0] * cy + v[2] * sy;
-            float z = -v[0] * sy + v[2] * cy;
-            float y = v[1];
-            // pitch about X
-            float const y2 = y * cp - z * sp;
-            float const z2 = y * sp + z * cp;
-            rv[k][0] = x;
-            rv[k][1] = y2;
-            rv[k][2] = z2;
-            float const zc = z2 + 3.4f;
-            if (zc < 0.4f) { behind = true; break; }
-            pt.p[k] = ImVec2(center.x + x * f * scale / zc, center.y - y2 * f * scale / zc);
-            depth += zc;
+        float const scale = size * 0.5f;
+        float const f = 3.0f;
+        float const lx = 0.36f, ly = 0.75f, lz = 0.55f;
+
+        cached_out.clear();
+        cached_out.reserve(g_tris.size());
+
+        for (auto const& t : g_tris) {
+            float const* verts[3] = { t.a, t.b, t.c };
+            float rv[3][3];
+            ProjTri pt{};
+            float depth = 0.f;
+            bool behind = false;
+            for (int k = 0; k < 3; k++) {
+                float const* v = verts[k];
+                // yaw about Y
+                float x = v[0] * cy + v[2] * sy;
+                float z = -v[0] * sy + v[2] * cy;
+                float y = v[1];
+                // pitch about X
+                float const y2 = y * cp - z * sp;
+                float const z2 = y * sp + z * cp;
+                rv[k][0] = x;
+                rv[k][1] = y2;
+                rv[k][2] = z2;
+                float const zc = z2 + 3.4f;
+                if (zc < 0.4f) { behind = true; break; }
+                pt.p[k] = ImVec2(center.x + x * f * scale / zc, center.y - y2 * f * scale / zc);
+                depth += zc;
+            }
+            if (behind) continue;
+
+            // screen-space degenerate cull
+            float const ax = pt.p[1].x - pt.p[0].x, ay = pt.p[1].y - pt.p[0].y;
+            float const bx = pt.p[2].x - pt.p[0].x, by = pt.p[2].y - pt.p[0].y;
+            float const area = ax * by - ay * bx;
+            if (area > -0.5f && area < 0.5f) continue;
+
+            // lambert: face normal of the rotated triangle vs a fixed light
+            float e1[3] = { rv[1][0] - rv[0][0], rv[1][1] - rv[0][1], rv[1][2] - rv[0][2] };
+            float e2[3] = { rv[2][0] - rv[0][0], rv[2][1] - rv[0][1], rv[2][2] - rv[0][2] };
+            float nx = e1[1] * e2[2] - e1[2] * e2[1];
+            float ny = e1[2] * e2[0] - e1[0] * e2[2];
+            float nz = e1[0] * e2[1] - e1[1] * e2[0];
+            float const nl = sqrtf(nx * nx + ny * ny + nz * nz);
+            if (nl > 1e-6f) { nx /= nl; ny /= nl; nz /= nl; }
+            float const lambert = nx * lx + ny * ly + nz * lz;
+            float const shade = 0.22f + 0.78f * (lambert < 0.f ? -lambert : lambert);
+
+            float r = (float)t.r * shade;
+            float g = (float)t.g * shade;
+            float bcol = (float)t.b_col * shade;
+
+            pt.depth = depth / 3.f;
+            pt.col = IM_COL32((int)std::clamp(r, 0.f, 255.f), (int)std::clamp(g, 0.f, 255.f),
+                              (int)std::clamp(bcol, 0.f, 255.f), 255);
+            cached_out.push_back(pt);
         }
-        if (behind) continue;
 
-        // screen-space degenerate cull
-        float const ax = pt.p[1].x - pt.p[0].x, ay = pt.p[1].y - pt.p[0].y;
-        float const bx = pt.p[2].x - pt.p[0].x, by = pt.p[2].y - pt.p[0].y;
-        float const area = ax * by - ay * bx;
-        if (area > -0.5f && area < 0.5f) continue;
-
-        // lambert: face normal of the rotated triangle vs a fixed light
-        float e1[3] = { rv[1][0] - rv[0][0], rv[1][1] - rv[0][1], rv[1][2] - rv[0][2] };
-        float e2[3] = { rv[2][0] - rv[0][0], rv[2][1] - rv[0][1], rv[2][2] - rv[0][2] };
-        float nx = e1[1] * e2[2] - e1[2] * e2[1];
-        float ny = e1[2] * e2[0] - e1[0] * e2[2];
-        float nz = e1[0] * e2[1] - e1[1] * e2[0];
-        float const nl = sqrtf(nx * nx + ny * ny + nz * nz);
-        if (nl > 1e-6f) { nx /= nl; ny /= nl; nz /= nl; }
-        float const lambert = nx * lx + ny * ly + nz * lz;
-        float const shade = 0.22f + 0.78f * (lambert < 0.f ? -lambert : lambert);
-
-        float r = (float)t.r * shade;
-        float g = (float)t.g * shade;
-        float bcol = (float)t.b_col * shade;
-
-        pt.depth = depth / 3.f;
-        pt.col = IM_COL32((int)std::clamp(r, 0.f, 255.f), (int)std::clamp(g, 0.f, 255.f),
-                          (int)std::clamp(bcol, 0.f, 255.f), 255);
-        out.push_back(pt);
+        std::sort(cached_out.begin(), cached_out.end(), [](ProjTri const& a, ProjTri const& b) {
+            return a.depth > b.depth;
+        });
     }
 
-    if (out.empty())
-        return;
-
-    std::sort(out.begin(), out.end(), [](ProjTri const& a, ProjTri const& b) {
-        return a.depth > b.depth;
-    });
-
-    for (auto const& pt : out)
+    for (auto const& pt : cached_out)
         dl->AddTriangleFilled(pt.p[0], pt.p[1], pt.p[2], pt.col);
 }
 

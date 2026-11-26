@@ -18,7 +18,11 @@ static DWORD FindProcess(const char* name) {
 }
 
 int main(int argc, char** argv) {
+#ifdef _WIN64
     const char* process = "cstrike_win64.exe";
+#else
+    const char* process = "hl2.exe";
+#endif
     const char* dll = nullptr;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-p") && i + 1 < argc) process = argv[++i];

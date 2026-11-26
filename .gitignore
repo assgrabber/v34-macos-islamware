@@ -1,4 +1,6 @@
 build/
+loader/build/
+*.app/
 third_party/alicekit/fonts/packed/font_atlas.hpp
 third_party/alicekit/fonts/packed/font_data.hpp
 .DS_Store
@@ -7,3 +9,6 @@ third_party/alicekit/fonts/packed/font_data.hpp
 *.exe
 *.bin
 *.log
+*.dmp
+*.mdmp
+backtrace.txt

@@ -4,6 +4,8 @@
 
 #include "assets.hpp"
 
+#include "alice_kit.hpp"
+#include "backends/backend.hpp"
 #include "premade/logo.hpp"
 #include "premade/logo_alt.hpp"
 #include "premade/banner.hpp"
@@ -23,8 +25,22 @@ ImTextureID c_assets::get( std::string const& key )
 
 void c_assets::load_premade( )
 {
+    release( );
     loader_fn( tex::k_logo_alt_png, sizeof tex::k_logo_alt_png, &assets_list[ "logo" ], true );
     loader_fn( tex::k_banner_png, sizeof tex::k_banner_png, &assets_list[ "banner" ], false );
+}
+
+void c_assets::release( )
+{
+    if ( alice::core && alice::core->backend )
+    {
+        for ( auto& kv : assets_list )
+        {
+            if ( kv.second )
+                alice::core->backend->destroy_texture( kv.second );
+        }
+    }
+    assets_list.clear( );
 }
 
 void c_assets::init_loader( std::function< void( void const* data, size_t data_size, ImTextureID* out, bool pixel_perfect ) > const& load_fn )

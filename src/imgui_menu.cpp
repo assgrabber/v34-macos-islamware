@@ -419,29 +419,97 @@ void MenuIslandsImpl(ImDrawList* draw, int width, int height) {
         }
     }
 
-    // bomb ESP preview: menu-only (it is a live style preview)
+    // bomb ESP preview: menu-only (double-click to switch compact/wide; wide is draggable)
     if (cfg.menu_open && cfg.bomb_preview && cfg.esp_bomb) {
-        float const x = 24.f;
-        float const y = (cfg.hotkey_list ? cfg.hotkey_y + island_h + 14.f : 140.f);
-        float const bw = 58.f, bh = 56.f;
-        draw->AddRectFilled({ x, y }, { x + bw, y + bh }, IM_COL32(2, 2, 2, 240), 6.f);
-        draw->AddRect({ x, y }, { x + bw, y + bh }, IM_COL32(100, 100, 100, 220), 6.f);
+        bool const wide = cfg.bomb_wide_preview;
+        float const bw = wide ? 144.f : 72.f;
+        float const bh = wide ? 62.f  : 68.f;
+        float x = wide ? cfg.bomb_x : 24.f;
+        float y = wide ? cfg.bomb_y : (cfg.hotkey_list ? cfg.hotkey_y + island_h + 14.f : 140.f);
+        float const disp_w = ImGui::GetIO().DisplaySize.x;
+        float const disp_h = ImGui::GetIO().DisplaySize.y;
+        if (wide) {
+            x = std::clamp(x, 8.f, std::max(8.f, disp_w - bw - 8.f));
+            y = std::clamp(y, 8.f, std::max(8.f, disp_h - bh - 8.f));
+            cfg.bomb_x = x;
+            cfg.bomb_y = y;
+        }
 
-        ImVec2 const icon_center(x + bw * 0.5f, y + 19.f);
-        auto& iconf = alice::core->fonts->get("undefeated");
-        if (iconf.ptr) {
-            ImU32 const white = IM_COL32(255, 255, 255, 255);
-            draw->AddText(iconf.ptr, iconf.size, { icon_center.x - 6.f, icon_center.y - 9.f }, white, "o");
+        // Handle double-click to toggle wide/compact and drag-to-move when wide
+        static bool bomb_dragging = false;
+        static ImVec2 bomb_drag_off{};
+        ImVec2 const mp = ImGui::GetIO().MousePos;
+        bool const hovered = mp.x >= x && mp.x <= x + bw && mp.y >= y && mp.y <= y + bh;
+        if (hovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+            cfg.bomb_wide_preview = !cfg.bomb_wide_preview;
+            bomb_dragging = false;
+            if (cfg.bomb_wide_preview && cfg.bomb_y < 10.f) {
+                cfg.bomb_x = 24.f;
+                cfg.bomb_y = cfg.hotkey_list ? cfg.hotkey_y + island_h + 14.f : 140.f;
+            }
+        } else if (wide) {
+            if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                bomb_dragging = true;
+                bomb_drag_off = { mp.x - x, mp.y - y };
+            }
+            if (bomb_dragging) {
+                if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+                    cfg.bomb_x = std::clamp(mp.x - bomb_drag_off.x, 8.f, std::max(8.f, disp_w - bw - 8.f));
+                    cfg.bomb_y = std::clamp(mp.y - bomb_drag_off.y, 8.f, std::max(8.f, disp_h - bh - 8.f));
+                    x = cfg.bomb_x;
+                    y = cfg.bomb_y;
+                } else {
+                    bomb_dragging = false;
+                }
+            }
+        } else {
+            bomb_dragging = false;
+        }
+
+        for (int gi = 6; gi >= 1; gi--) {
+            float const e = gi * 3.0f;
+            draw->AddRectFilled({ x - e, y - e }, { x + bw + e, y + bh + e },
+                                IM_COL32(1, 1, 1, 12 + (6 - gi) * 7), 12.f);
+        }
+        draw->AddRectFilled({ x, y }, { x + bw, y + bh }, IM_COL32(1, 1, 1, 235), 8.f);
+
+        ImVec2 const icon_center = wide ? ImVec2(x + 30.f, y + bh * 0.5f) : ImVec2(x + bw * 0.5f, y + 24.f);
+        if (alice::core && alice::core->fonts) {
+            auto& iconf = alice::core->fonts->get("undefeated");
+            if (iconf.ptr) {
+                ImFontGlyph const* g = iconf.ptr->FindGlyph('o');
+                float const scale = iconf.size / iconf.ptr->FontSize;
+                float const gx = g ? (g->X0 + g->X1) * 0.5f * scale : 6.f;
+                float const gy = g ? (g->Y0 + g->Y1) * 0.5f * scale : 9.f;
+                draw->AddText(iconf.ptr, iconf.size,
+                              { icon_center.x - gx, icon_center.y - gy },
+                              IM_COL32(255, 255, 255, 255), "o");
+            }
+        } else {
+            draw->AddRectFilled({ icon_center.x - 6.f, icon_center.y - 4.f },
+                                { icon_center.x + 6.f, icon_center.y + 5.f },
+                                IM_COL32(235, 235, 240, 255), 1.5f);
+            draw->AddRectFilled({ icon_center.x - 3.f, icon_center.y - 7.f },
+                                { icon_center.x + 1.f, icon_center.y - 4.f },
+                                IM_COL32(200, 200, 210, 255), 1.f);
+            draw->AddCircleFilled({ icon_center.x + 2.5f, icon_center.y - 1.f }, 1.6f,
+                                  IM_COL32(255, 75, 75, 255), 10);
         }
 
         float const pi = 3.14159265358979323846f;
         float const frac = 0.6f;
-        draw->PathArcTo(icon_center, 13.f, -pi * 0.5f, -pi * 0.5f + 2.f * pi * frac, 40);
-        draw->PathStroke(IM_COL32(255, 90, 70, 240), 0, 2.f);
+        draw->PathArcTo(icon_center, 15.f, -pi * 0.5f, -pi * 0.5f + 2.f * pi * frac, 40);
+        draw->PathStroke(IM_COL32(255, 75, 75, 255), 0, 2.5f);
 
-        char const* timer = "34.9";
-        ImVec2 const ts = ImGui::CalcTextSize(timer);
-        draw->AddText({ icon_center.x - ts.x * 0.5f, icon_center.y + 15.f }, IM_COL32(255, 120, 100, 255), timer);
+        char const* timer = "34.9s";
+        if (wide) {
+            float const tx = x + 60.f;
+            draw->AddText({ tx, y + bh * 0.5f - 15.f }, IM_COL32(245, 245, 250, 255), "Plant A");
+            draw->AddText({ tx, y + bh * 0.5f + 3.f }, IM_COL32(255, 85, 85, 255), timer);
+        } else {
+            ImVec2 const ts = ImGui::CalcTextSize(timer);
+            draw->AddText({ icon_center.x - ts.x * 0.5f, icon_center.y + 18.f }, IM_COL32(255, 85, 85, 255), timer);
+        }
 
         char const* note = "bomb ESP preview";
         ImVec2 const ns = ImGui::CalcTextSize(note);
@@ -732,6 +800,7 @@ static void RenderPlayers() {
     if (ImGui::BeginChild("##esp_settings", { left_w, 0.f }, true)) {
         group("Elements");
         Check("Player ESP", &cfg.esp, "Players");
+        Check("Bomb ESP", &cfg.esp_bomb, "Players");
         ImGui::BeginDisabled(!cfg.esp);
         Check("Team check", &cfg.esp_team_check, "Players");
         Row("Box", &cfg.esp_box, cfg.esp_box_color, cfg.esp_box_outline);
@@ -848,10 +917,21 @@ static void RenderPlayers() {
         glb_preview::Draw(dl, center, bmax.y - bmin.y - 50.f);
         esp_layout::RenderPreview(dl, bmin, bmax, 1.f, v);
 
-        char const* hint = "Drag to move  |  Hold Shift + drag to resize (Shift + RMB reset)";
-        ImVec2 const hs = ImGui::CalcTextSize(hint);
-        dl->AddText(ImVec2(origin.x + (avail.x - hs.x) * 0.5f, origin.y + avail.y - hs.y - 8.f),
-                    IM_COL32(255, 255, 255, 110), hint);
+        static char const* const hints[] = {
+            "Drag to move",
+            "Shift + drag to resize",
+            "Shift + RMB to reset",
+        };
+        float const hfs = ImGui::GetFontSize() * 0.82f;
+        float hy = origin.y + avail.y - 8.f;
+        for (int hi = 2; hi >= 0; hi--) {
+            ImVec2 const hs = ImGui::GetFont()->CalcTextSizeA(hfs, FLT_MAX, 0.f, hints[hi]);
+            hy -= hs.y;
+            dl->AddText(ImGui::GetFont(), hfs,
+                        ImVec2(origin.x + 10.f, hy),
+                        IM_COL32(255, 255, 255, 110), hints[hi]);
+            hy -= 2.f;
+        }
     }
     ImGui::EndChild();
     ImGui::PopID();
@@ -889,13 +969,12 @@ static void RenderModels() {
         ImGui::EndDisabled();
 
         Check("Disable occlusion", &cfg.chams_disable_occlusion, "Models");
-        Check("Fake model (what others see)", &cfg.fake_model, "Models");
 
         ImGui::SeparatorText("Held weapons");
         Check("Enemy weapons", &cfg.wchams_enemy, "Models");
         Check("Teammate weapons", &cfg.wchams_team, "Models");
         ImGui::TextDisabled("Enemy/team use their layer; Weapons applies to");
-        ImGui::TextDisabled("third-person and dropped weapons.");
+        ImGui::TextDisabled("your third-person weapon.");
     },
     [] {
         ImGui::SeparatorText("First person");
@@ -982,6 +1061,17 @@ static void RenderWorld() {
         Check("Debris", &cfg.rem_debris, "World");
         Check("Blood", &cfg.rem_blood, "World");
         Check("Particles", &cfg.rem_particles, "World");
+
+        group("Scope");
+        Check("Remove scope overlay", &cfg.rem_scope, "World");
+        ImGui::BeginDisabled(!cfg.rem_scope);
+        Row("Custom scope lines", &cfg.custom_scope, cfg.custom_scope_color);
+        ImGui::BeginDisabled(!cfg.custom_scope);
+        ImGui::SliderInt("Scope gap", &cfg.scope_gap, -15, 300, "%d");
+        ImGui::SliderInt("Scope length", &cfg.scope_length, 0, 300, "%d");
+        Check("Invert scope gradient", &cfg.scope_invert, "World");
+        ImGui::EndDisabled();
+        ImGui::EndDisabled();
 
         group("Grenades");
         Check("Trajectory prediction", &cfg.nade_predict, "World");

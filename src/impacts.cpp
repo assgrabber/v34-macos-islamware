@@ -114,8 +114,15 @@ static bool TracerLengthOk(Vector const& start, Vector const& end);
 // Called at the start of every base client CreateMove, i.e. right after the
 // previous command was predicted.  A clip drop means the previous attack
 // command really fired a round.
+static bool g_shot_fired_flag = false;
+
+bool Impacts_ConsumeFired() {
+    bool const f = g_shot_fired_flag;
+    g_shot_fired_flag = false;
+    return f;
+}
+
 void Impacts_TrackShot() {
-    if (!cfg.bullet_impacts) { g_pending = false; return; }
     void* local = GetLocalEntity();
     if (!local) { g_pending = false; g_last_weapon = 0; g_last_clip = -1; return; }
     if (*reinterpret_cast<char*>((char*)local + off::m_lifeState) != 0) {
@@ -139,7 +146,8 @@ void Impacts_TrackShot() {
 
     bool const fired = g_last_clip >= 0 && clip >= 0 && clip < g_last_clip;
     g_last_clip = clip;
-    if (!fired) return;
+    if (fired) g_shot_fired_flag = true;
+    if (!fired || !cfg.bullet_impacts) return;
 
     if (!g_pending || GetTickCount() - g_pending_tick > 300) {
         g_pending = false;
@@ -325,10 +333,36 @@ void Tracers_Draw(ImDrawList* draw, int width, int height) {
         }
         if (best_a < 0 || best_b <= best_a) continue;
 
-        Vector const vstart = pts[best_a];
-        Vector const vend = pts[best_b];
+        Vector vstart = pts[best_a];
+        Vector vend = pts[best_b];
         Vector const seg = vend - vstart;
         if (seg.x*seg.x + seg.y*seg.y + seg.z*seg.z < 12.0f * 12.0f) continue;
+
+        // Clip the segment against the camera near plane so 1st-person shots
+        // (where tr.start == eye == view_origin) project cleanly onto screen.
+        Vector cam_fwd, cam_right, cam_up;
+        AngleVectors(view_angles, cam_fwd, cam_right, cam_up);
+        if (tr.shooter == local_index && best_a == 0) {
+            Vector const dv = vstart - view_origin;
+            if (dv.x*dv.x + dv.y*dv.y + dv.z*dv.z < 16.0f * 16.0f) {
+                vstart = vstart + cam_fwd * 10.0f + cam_right * 4.0f - cam_up * 3.0f;
+            }
+        }
+        auto dot_cam = [&](Vector const& p) -> float {
+            Vector const d = p - view_origin;
+            return d.x * cam_fwd.x + d.y * cam_fwd.y + d.z * cam_fwd.z;
+        };
+        float const d0 = dot_cam(vstart);
+        float const d1 = dot_cam(vend);
+        constexpr float kNear = 4.0f;
+        if (d0 < kNear && d1 < kNear) continue;
+        if (d0 < kNear && d1 >= kNear) {
+            float const t = (kNear - d0) / (d1 - d0);
+            vstart = vstart + (vend - vstart) * t;
+        } else if (d1 < kNear && d0 >= kNear) {
+            float const t = (kNear - d0) / (d1 - d0);
+            vend = vstart + (vend - vstart) * t;
+        }
 
         ImVec2 a, b;
         if (!WorldToScreen(vstart, a, width, height)) continue;
@@ -381,7 +415,7 @@ void Impacts_Probe() {
     struct { uintptr_t off; int size; } found[64];
     int count = 0;
 
-    for (uintptr_t off = 0x0800; off < 0x18000 && count < 64; off += 8) {
+    for (uintptr_t off = 0x0800; off < 0x18000 && count < 64; off += sizeof(void*)) {
         if (!Readable((char*)local + off, sizeof(RawVector))) continue;
         RawVector const* vec = reinterpret_cast<RawVector*>((char*)local + off);
         int const size = vec->size;

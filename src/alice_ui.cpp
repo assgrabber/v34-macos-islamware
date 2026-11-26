@@ -1495,7 +1495,11 @@ namespace
             c_ui_elements::start( "Custom menu (ImGui)" ).add_toggle( &cfg.menu_imgui ).finish( );
             c_ui_elements::start( "Click a bind box, then press a key" ).finish( );
             c_ui_elements::start( "Right-click a function to bind it" ).finish( );
+#ifdef _WIN64
             c_ui_elements::start( "Interface: VEngineClient014 / x64" ).finish( );
+#else
+            c_ui_elements::start( "Interface: VEngineClient012 / v34 (x86)" ).finish( );
+#endif
             c_ui_elements::end_group( );
 
             // server browser fix: Valve retired the master server this build's
@@ -1751,6 +1755,15 @@ namespace alice_ui
 
     void Shutdown( )
     {
+        if ( core )
+        {
+            if ( core->fonts && core->fonts->get_loader( ) )
+                core->fonts->get_loader( )->release( );
+            if ( core->assets )
+                core->assets->release( );
+            if ( core->blur )
+                core->blur->resize( 0, 0 );
+        }
         core.reset( );
         g_initialized = false;
         g_open = false;
@@ -1758,8 +1771,15 @@ namespace alice_ui
 
     void OnLostDevice( )
     {
-        if ( core && core->blur )
-            core->blur->resize( 0, 0 );
+        if ( core )
+        {
+            if ( core->blur )
+                core->blur->resize( 0, 0 );
+            if ( core->fonts && core->fonts->get_loader( ) )
+                core->fonts->get_loader( )->release_gpu( );
+            if ( core->assets )
+                core->assets->release( );
+        }
     }
 
     void OnResetDevice( IDirect3DDevice9* device, int width, int height )
@@ -1808,20 +1828,18 @@ namespace alice_ui
 
     void Toggle( )
     {
-        if ( !g_initialized )
-            return;
-        g_open = !g_open;
+        g_open = !cfg.menu_open;
         cfg.menu_open = g_open;
-        core->ui->set_presence( g_open );
+        if ( g_initialized && core && core->ui )
+            core->ui->set_presence( g_open );
     }
 
     void SetOpen( bool open )
     {
-        if ( !g_initialized )
-            return;
         g_open = open;
         cfg.menu_open = open;
-        core->ui->set_presence( open );
+        if ( g_initialized && core && core->ui )
+            core->ui->set_presence( open );
         if ( !open )
         {
             g_bind_window_open = false;

@@ -41,6 +41,7 @@ namespace alice
 
         font_format::Rasterizer rasterizer( int index ) const;
 
+        void release_gpu( );
         void release( );
 
     private:

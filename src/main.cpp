@@ -89,6 +89,7 @@ static bool InitInterfaces() {
     vstdlib_module = GetModuleHandleA("vstdlib.dll");
     if (!engine_module || !client_module) return false;
 
+#ifdef _WIN64
     engine.self = GetInterface(engine_module, "VEngineClient014");
     render_view.self = GetInterface(engine_module, "VEngineRenderView014");
     base_client = GetInterface(client_module, "VClient017");
@@ -102,6 +103,25 @@ static bool InitInterfaces() {
     physics_props.self = GetInterface(GetModuleHandleA("vphysics.dll"), "VPhysicsSurfaceProps001");
     mdl_cache.self = GetInterface(GetModuleHandleA("datacache.dll"), "MDLCache004");
     studio_render = GetInterface(GetModuleHandleA("studiorender.dll"), "VStudioRender025");
+#else
+    engine.self = GetInterface(engine_module, "VEngineClient012");
+    render_view.self = GetInterface(engine_module, "VEngineRenderView012");
+    base_client = GetInterface(client_module, "VClient013");
+    entity_list.self = GetInterface(client_module, "VClientEntityList003");
+    debug_overlay.self = GetInterface(engine_module, "VDebugOverlay003");
+    engine_trace.self = GetInterface(engine_module, "EngineTraceClient003");
+    cvar.self = GetInterface(engine_module, "VEngineCvar003");
+    if (!cvar.self || !cvar.FindVar("sv_cheats")) {
+        void* vs_cvar = GetInterface(vstdlib_module, "VEngineCvar003");
+        if (vs_cvar) cvar.self = vs_cvar;
+    }
+    model_render.self = GetInterface(engine_module, "VEngineModel012");
+    model_info.self = GetInterface(engine_module, "VModelInfoClient003");
+    material_system.self = GetInterface(GetModuleHandleA("materialsystem.dll"), "VMaterialSystem076");
+    physics_props.self = GetInterface(GetModuleHandleA("vphysics.dll"), "VPhysicsSurfaceProps001");
+    mdl_cache.self = GetInterface(GetModuleHandleA("datacache.dll"), "MDLCache004");
+    studio_render = GetInterface(GetModuleHandleA("studiorender.dll"), "VStudioRender023");
+#endif
 
     ConVar* test_cvar = cvar.self ? cvar.FindVar("mat_fullbright") : nullptr;
     Log("bases: client=%p engine=%p", client_module, engine_module);
@@ -110,25 +130,28 @@ static bool InitInterfaces() {
     return engine.self && entity_list.self;
 }
 
+struct FindWinCtx { DWORD pid; HWND found; };
+static BOOL CALLBACK FindGameWindowEnum(HWND w, LPARAM lp) {
+    FindWinCtx* c = reinterpret_cast<FindWinCtx*>(lp);
+    DWORD pid = 0;
+    GetWindowThreadProcessId(w, &pid);
+    if (pid == c->pid && IsWindowVisible(w)) {
+        char cls[64] = { 0 };
+        GetClassNameA(w, cls, sizeof(cls));
+        if (strstr(cls, "Valve") || strstr(cls, "SDL")) {
+            c->found = w;
+            return FALSE;
+        }
+    }
+    return TRUE;
+}
+
 static HWND FindGameWindow() {
     HWND h = FindWindowA("Valve001", nullptr);
     if (h) return h;
     // fall back: first visible top-level window owned by this process
-    struct Ctx { DWORD pid; HWND found; } ctx{ GetCurrentProcessId(), nullptr };
-    EnumWindows([](HWND w, LPARAM lp) -> BOOL {
-        Ctx* c = reinterpret_cast<Ctx*>(lp);
-        DWORD pid = 0;
-        GetWindowThreadProcessId(w, &pid);
-        if (pid == c->pid && IsWindowVisible(w)) {
-            char cls[64] = { 0 };
-            GetClassNameA(w, cls, sizeof(cls));
-            if (strstr(cls, "Valve") || strstr(cls, "SDL")) {
-                c->found = w;
-                return FALSE;
-            }
-        }
-        return TRUE;
-        }, reinterpret_cast<LPARAM>(&ctx));
+    FindWinCtx ctx{ GetCurrentProcessId(), nullptr };
+    EnumWindows(FindGameWindowEnum, reinterpret_cast<LPARAM>(&ctx));
     return ctx.found;
 }
 
@@ -160,9 +183,11 @@ static void TypeConsoleText(const char* text) {
 static DWORD WINAPI InitThread(LPVOID) {
     SetStage("init");
     Log("=== islamware-css loaded (build 9540945) ===");
+#ifdef _WIN64
     // emulator + steam.inf must be corrected before the engine/emu read them
     ApplyEmuNetworkFix(cfg.allow_internet);
     ApplyVersionSpoof();
+#endif
     // Must start before the engine initialises SteamNetworkingSockets: the
     // connect fix rewrites the imports the engine is about to call.
     // A local listen server (-lan-test) needs the untouched SNS path, since
@@ -193,8 +218,10 @@ static DWORD WINAPI InitThread(LPVOID) {
     SetStage("running");
     CreateThread(nullptr, 0, WatchdogThread, nullptr, 0, nullptr);
 
-    // server browser fix: refresh the community list in the background
+#ifdef _WIN64
+    // server browser fix: refresh the community list in the background (v93 / protocol 17)
     if (cfg.browser_fix) StartServerListRefresh("startup");
+#endif
 
     while (true) {
         FILE* f = fopen("C:\\islamware_cmd.txt", "r");

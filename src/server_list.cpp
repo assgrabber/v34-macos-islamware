@@ -219,7 +219,7 @@ static DWORD WINAPI RefreshThread(LPVOID) {
     ctx.client_proto = client_proto;
 
     static HANDLE workers[24];
-    auto worker = [](LPVOID lp) -> DWORD {
+    auto worker = [](LPVOID lp) WINAPI -> DWORD {
         ProbeCtx* c = (ProbeCtx*)lp;
         for (;;) {
             LONG i = InterlockedIncrement(&next_index) - 1;

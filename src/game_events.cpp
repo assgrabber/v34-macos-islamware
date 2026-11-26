@@ -15,8 +15,8 @@ namespace {
 
 ULONGLONG g_player_shot_ms[65] = {};
 
-void ListenerDtor(void*, unsigned int) {}
-int  ListenerDebugID(void*) { return 42; }
+HOOK_THISCALL(void, ListenerDtor, void*, unsigned int) { (void)self; }
+HOOK_THISCALL(int, ListenerDebugID, void*) { (void)self; return 42; }
 
 int PlayerIndexForUserID(int userid) {
     if (userid <= 0) return -1;
@@ -54,13 +54,13 @@ int PlayerIndexForUserID(int userid) {
 }
 
 // IGameEvent: [1] GetName, [6] GetInt, [7] GetFloat
-void ListenerFire(void* self, void* event) {
+HOOK_THISCALL(void, ListenerFire, void*, void* event) {
     (void)self;
     if (!event) return;
 
-    typedef const char* (__fastcall* GetNameFn)(void*);
-    typedef int   (__fastcall* GetIntFn)(void*, const char*, int);
-    typedef float (__fastcall* GetFloatFn)(void*, const char*, float);
+    TYPEDEF_THISCALL(const char*, GetNameFn, void*);
+    TYPEDEF_THISCALL(int, GetIntFn, void*, const char*, int);
+    TYPEDEF_THISCALL(float, GetFloatFn, void*, const char*, float);
 
     const char* name = VFunc<GetNameFn>(event, 1)(event);
     if (!name) return;
@@ -137,8 +137,8 @@ void InstallGameEvents() {
     //   1 LoadEventsFromFile  2 Reset  3 AddListener  4 FindListener
     // Slot 2 is Reset() - calling it wipes every event definition and the
     // engine then crashes creating events like player_connect on connect.
-    typedef bool (__fastcall* AddListenerFn)(void*, void*, const char*, bool);
-    typedef bool (__fastcall* FindListenerFn)(void*, void*, const char*);
+    TYPEDEF_THISCALL(bool, AddListenerFn, void*, void*, const char*, bool);
+    TYPEDEF_THISCALL(bool, FindListenerFn, void*, void*, const char*);
 
     bool const ok = VFunc<AddListenerFn>(mgr, 3)(mgr, &g_listener, "bullet_impact", false);
     bool const registered = VFunc<FindListenerFn>(mgr, 4)(mgr, &g_listener, "bullet_impact");

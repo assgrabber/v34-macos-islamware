@@ -24,7 +24,7 @@ extern volatile int g_safe_call_active;
 // what the engine itself does when it queries bones.  No mask forcing, no
 // IK games, no faults.
 // ---------------------------------------------------------------------------
-typedef bool (__fastcall* SetupBonesFn)(void*, matrix3x4_t*, int, int, float);
+TYPEDEF_THISCALL(bool, SetupBonesFn, void*, matrix3x4_t*, int, int, float);
 static SetupBonesFn oSetupBones = nullptr;
 
 struct BoneCacheEntry {
@@ -32,6 +32,7 @@ struct BoneCacheEntry {
     int count;
     int frame;
     bool valid;
+    Vector origin;
     matrix3x4_t bones[128];
 };
 static BoneCacheEntry g_bone_cache[65];
@@ -61,6 +62,7 @@ static void EnsureSetupBonesFn(void* renderable) {
     void** rvt = *reinterpret_cast<void***>(renderable);
     if (!rvt) return;
 
+#ifdef _WIN64
     uintptr_t const target = (uintptr_t)client_module + 0x7b4a0;   // C_BaseAnimating::SetupBones
     for (int i = 0; i < 64; i++) {
         if ((uintptr_t)rvt[i] != target) continue;
@@ -71,6 +73,11 @@ static void EnsureSetupBonesFn(void* renderable) {
     }
     g_bone_fn_state = -1;
     Log("[bones] SetupBones not found in the player renderable vtable");
+#else
+    oSetupBones = reinterpret_cast<SetupBonesFn>(rvt[SETUPBONES_INDEX]);
+    g_bone_fn_state = oSetupBones ? 1 : -1;
+    Log("[bones] SetupBones v34 renderable vtable[%d]=%p", SETUPBONES_INDEX, (void*)oSetupBones);
+#endif
 }
 
 static bool MemReadable(void const* p, size_t n) {
@@ -82,33 +89,40 @@ static bool MemReadable(void const* p, size_t n) {
     return (uintptr_t)p + n <= (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
 }
 
-static bool GetEntityBones(int index, void* entity, matrix3x4_t* out, int* out_count = nullptr) {
-    if (!entity || index < 1 || index > 64 || !client_module) return false;
-    if (*reinterpret_cast<int*>((char*)entity + off::m_nModelIndex) <= 0) return false;
-    // SetupBones on dormant/despawning entities faults inside the engine
-    // (its IK state is not maintained) - visible players only
-    if (EntityIsStale(entity, index)) return false;
-    // pre-validate everything the engine touches: an engine-internal fault is
-    // caught by the safe-call, but the longjmp can leave an engine lock held
-    // and stalls the render thread - so keep the fault odds as low as possible
-    if (!MemReadable((char*)entity + off::m_vecOrigin, sizeof(Vector))) return false;
-    Vector const org = *reinterpret_cast<Vector*>((char*)entity + off::m_vecOrigin);
-    if (!(org.x == org.x) || !(org.y == org.y) || !(org.z == org.z)) return false; // NaN
-    if (fabsf(org.x) > 100000.f || fabsf(org.y) > 100000.f) return false;
-    // the renderable subobject is embedded at entity+8 (its vtable is its
-    // first field); validate the subobject itself, not the vtable pointer
-    if (!MemReadable((char*)entity + 8, 0xB60)) return false;
-    int const pre_count = *reinterpret_cast<int*>((char*)entity + 8 + 0xB50);
-    if (pre_count <= 0 || pre_count > 128) return false;
+static const matrix3x4_t* GetEntityBonesPtr(int index, void* entity, int* out_count = nullptr, Vector* out_cached_origin = nullptr) {
+    if (!entity || index < 1 || index > 64 || !client_module) return nullptr;
+    if (*reinterpret_cast<int*>((char*)entity + off::m_nModelIndex) <= 0) return nullptr;
+    if (EntityIsStale(entity, index)) return nullptr;
 
+#ifdef _WIN64
+    if (!MemReadable((char*)entity + off::m_vecOrigin, sizeof(Vector))) return nullptr;
+    Vector const org = *reinterpret_cast<Vector*>((char*)entity + off::m_vecOrigin);
+    if (!(org.x == org.x) || !(org.y == org.y) || !(org.z == org.z)) return nullptr;
+    if (fabsf(org.x) > 100000.f || fabsf(org.y) > 100000.f) return nullptr;
+    if (!MemReadable((char*)entity + 8, 0xB60)) return nullptr;
+    int const pre_count = *reinterpret_cast<int*>((char*)entity + 8 + 0xB50);
+    if (pre_count <= 0 || pre_count > 128) return nullptr;
     void* renderable = reinterpret_cast<char*>(entity) + 8;
+#else
+    void* renderable = reinterpret_cast<char*>(entity) + 4;
+#endif
     EnsureSetupBonesFn(renderable);
-    if (!oSetupBones) return false;
+    if (!oSetupBones) return nullptr;
 
     BoneCacheEntry& e = g_bone_cache[index];
+#ifndef _WIN64
+    // On v34, SetupBones touches datacache.dll (main-thread only).  Read the
+    // bones cached on the main thread by Bones_OnFrameStage().
+    if (e.valid && e.renderable == renderable) {
+        if (out_count) *out_count = e.count;
+        if (out_cached_origin) *out_cached_origin = e.origin;
+        return e.bones;
+    }
+    return nullptr;
+#else
     if (!(e.valid && e.renderable == renderable && e.frame == g_bone_frame)) {
         LONG const fault = g_bone_fault_time;
-        if (fault && GetTickCount() - (DWORD)fault < 12000) return false;
+        if (fault && GetTickCount() - (DWORD)fault < 12000) return nullptr;
 
         memset(e.bones, 0, sizeof(e.bones));
         g_safe_call_active = 1;
@@ -116,22 +130,32 @@ static bool GetEntityBones(int index, void* entity, matrix3x4_t* out, int* out_c
             g_safe_call_active = 0;
             g_bone_fault_time = (LONG)GetTickCount();
             Log("[bones] SetupBones faulted - bone ESP paused for 12s");
-            return false;
+            return nullptr;
         }
         bool const ok = oSetupBones(renderable, e.bones, 128, 0x7FF00, engine.Time());
         g_safe_call_active = 0;
-        if (!ok) return false;
+        if (!ok) return nullptr;
 
         int const count = *reinterpret_cast<int*>((char*)renderable + 0xB50);
         e.count = (count > 0 && count <= 128) ? count : 128;
+        e.origin = org;
         e.renderable = renderable;
         e.frame = g_bone_frame;
         e.valid = true;
     }
 
+    if (out_count) *out_count = e.count;
+    if (out_cached_origin) *out_cached_origin = e.origin;
+    return e.bones;
+#endif
+}
+
+static bool GetEntityBones(int index, void* entity, matrix3x4_t* out, int* out_count = nullptr) {
+    int n = 0;
+    const matrix3x4_t* ptr = GetEntityBonesPtr(index, entity, &n);
+    if (!ptr) return false;
     memset(out, 0, sizeof(matrix3x4_t) * 128);
-    int const n = e.count;
-    memcpy(out, e.bones, sizeof(matrix3x4_t) * (size_t)n);
+    memcpy(out, ptr, sizeof(matrix3x4_t) * (size_t)n);
     if (out_count) *out_count = n;
     return true;
 }
@@ -166,7 +190,14 @@ static bool NameEndsWith(const char* name, const char* suffix) {
 // to hardcode across this build's subobjects, so the entity is scanned for a
 // CStudioHdr-like pointer chain that validates as a real "IDST" header.
 static void* FindStudioHdr(void* entity, int model_index) {
-    for (uintptr_t off = 0xB00; off <= 0xE00; off += 8) {
+#ifdef _WIN64
+    constexpr uintptr_t STUDIO_SCAN_START = 0xB00;
+    constexpr uintptr_t STUDIO_SCAN_END   = 0xE00;
+#else
+    constexpr uintptr_t STUDIO_SCAN_START = 0x600;
+    constexpr uintptr_t STUDIO_SCAN_END   = 0x900;
+#endif
+    for (uintptr_t off = STUDIO_SCAN_START; off <= STUDIO_SCAN_END; off += sizeof(void*)) {
         if (!ReadableRange((char*)entity + off, sizeof(void*))) break;
         void* const cached = *reinterpret_cast<void**>((char*)entity + off);
         if (!cached) continue;
@@ -205,9 +236,10 @@ static BoneMap* GetBoneMap(void* entity) {
     BoneMap& m = g_bone_maps[model_index];
     if (m.model_index == model_index && m.valid) return &m;
 
-    // Resolve through IVModelInfo::GetStudiomodel (slot 21) - the engine loads
-    // and returns the model's own header.  Fall back to the entity scan.
+    // On x64, IVModelInfo::GetStudiomodel is safe; on v34, MDLCache/datacache
+    // is main-thread only and faults if called from the render thread.
     void* studio = nullptr;
+#ifdef _WIN64
     {
         const void* model = model_info.GetModel(model_index);
         if (model) {
@@ -227,6 +259,9 @@ static BoneMap* GetBoneMap(void* entity) {
         if (!studio)
             studio = FindStudioHdr(entity, model_index);
     }
+#else
+    studio = FindStudioHdr(entity, model_index);
+#endif
     if (!studio) {
         static volatile LONG s_fail_logged = 0;
         if (!s_fail_logged) {
@@ -325,9 +360,10 @@ bool GetEntityAimBones(void* entity, int out[5]) {
 // (skirt / weapon / finger bones would inflate the box), so the box matches
 // the skeleton exactly.
 static bool GetBoneBounds(int index, void* entity, Vector& feet, Vector& top) {
-    matrix3x4_t bones[128];
     int count = 0;
-    if (!GetEntityBones(index, entity, bones, &count)) return false;
+    Vector cached_org;
+    const matrix3x4_t* bones = GetEntityBonesPtr(index, entity, &count, &cached_org);
+    if (!bones) return false;
 
     int body[24];
     int n = 0;
@@ -358,6 +394,11 @@ static bool GetBoneBounds(int index, void* entity, Vector& feet, Vector& top) {
     // bones can sit at the map origin or anywhere else, and one such bone in
     // the min/max set sends the box to a random place
     Vector const org = *reinterpret_cast<Vector*>((char*)entity + off::m_vecOrigin);
+#ifndef _WIN64
+    Vector const bone_delta = org - cached_org;
+#else
+    Vector const bone_delta(0.0f, 0.0f, 0.0f);
+#endif
 
     const float k = 1.0e9f;
     Vector mn(k, k, k), mx(-k, -k, -k);
@@ -365,9 +406,9 @@ static bool GetBoneBounds(int index, void* entity, Vector& feet, Vector& top) {
     for (int j = 0; j < n; j++) {
         int const i = body[j];
         if (i < 0 || i >= count) continue;
-        float x = bones[i].m[0][3];
-        float y = bones[i].m[1][3];
-        float z = bones[i].m[2][3];
+        float x = bones[i].m[0][3] + bone_delta.x;
+        float y = bones[i].m[1][3] + bone_delta.y;
+        float z = bones[i].m[2][3] + bone_delta.z;
         if (x == 0.0f && y == 0.0f && z == 0.0f) continue;
         if (fabsf(x) > 32768.0f || fabsf(y) > 32768.0f || fabsf(z) > 32768.0f) continue;
         if (fabsf(x - org.x) > 128.0f || fabsf(y - org.y) > 128.0f ||
@@ -386,8 +427,8 @@ static bool GetBoneBounds(int index, void* entity, Vector& feet, Vector& top) {
     {
         BoneMap* map = GetBoneMap(entity);
         if (map && map->pelvis >= 0 && map->pelvis < count) {
-            float px = bones[map->pelvis].m[0][3];
-            float py = bones[map->pelvis].m[1][3];
+            float px = bones[map->pelvis].m[0][3] + bone_delta.x;
+            float py = bones[map->pelvis].m[1][3] + bone_delta.y;
             if (!(px == 0.0f && py == 0.0f) &&
                 fabsf(px - org.x) < 48.0f && fabsf(py - org.y) < 48.0f) {
                 cx = px;
@@ -407,11 +448,20 @@ static int LocalIndex() {
 }
 
 bool IsPlayerIndex(int index) {
-    if (index < 1 || !engine.self) return false;
-    // GetPlayerInfo is bounds-checked by the engine; the old client-class
-    // string dereference crashed on stale class pointers (strstr on garbage).
+    if (index < 1 || index > 64 || !engine.self) return false;
+    // Cache GetPlayerInfo per slot (250 ms TTL) so hot loops (Bones, ESP,
+    // Chams, Aimbot) don't lock the engine user-info table hundreds of times
+    // per frame.
+    static bool s_cached[65] = {};
+    static DWORD s_stamp[65] = {};
+    DWORD const now = GetTickCount();
+    if (now - s_stamp[index] < 250)
+        return s_cached[index];
     player_info_t info = {};
-    return engine.GetPlayerInfo(index, &info);
+    bool const ok = engine.GetPlayerInfo(index, &info);
+    s_cached[index] = ok;
+    s_stamp[index] = now;
+    return ok;
 }
 
 Vector PlayerEye(void* ent) {
@@ -470,7 +520,7 @@ bool EntityIsStale(void* ent, int index) {
     if (entity_list.self && index > 0) {
         void* networkable = entity_list.GetClientNetworkable(index);
         if (networkable) {
-            bool dormant = VFunc<bool(__fastcall*)(void*)>(networkable, 8)(networkable);
+            bool dormant = VFunc<bool(THISCALL_CC*)(void*)>(networkable, 8)(networkable);
             return dormant;
         }
     }
@@ -488,11 +538,11 @@ bool EntityIsStale(void* ent, int index) {
 static void* g_trace_skip1 = nullptr;
 static void* g_trace_skip2 = nullptr;
 
-static bool __fastcall TraceFilter_ShouldHit(void*, void* entity, int) {
+static HOOK_THISCALL(bool, TraceFilter_ShouldHit, void*, void* entity, int) {
     // The engine passes nullptr for world geometry - it must always be hit.
     return entity != g_trace_skip1 && entity != g_trace_skip2;
 }
-static int __fastcall TraceFilter_GetType(void*) {
+static HOOK_THISCALL(int, TraceFilter_GetType, void*) {
     return 0; // TRACE_EVERYTHING
 }
 static void* g_trace_filter_vtable[2] = {
@@ -559,12 +609,21 @@ bool TraceLine(const Vector& from, const Vector& to, float& fraction, Vector& en
         *out_contents = *reinterpret_cast<int*>(result + 0x30);
     if (out_startsolid)
         *out_startsolid = startsolid || allsolid;
+#ifdef _WIN64
     if (out_surface)
         *out_surface = *reinterpret_cast<const char**>(result + 0x40);
     if (out_surface_props)
         *out_surface_props = *reinterpret_cast<short*>(result + 0x48);
     if (out_entity)
         *out_entity = *reinterpret_cast<void**>(result + 0x58);
+#else
+    if (out_surface)
+        *out_surface = *reinterpret_cast<const char**>(result + 0x3C);
+    if (out_surface_props)
+        *out_surface_props = *reinterpret_cast<short*>(result + 0x40);
+    if (out_entity)
+        *out_entity = *reinterpret_cast<void**>(result + 0x4C);
+#endif
     return fraction < 0.97f || startsolid || allsolid;
 }
 
@@ -604,8 +663,8 @@ static bool GetActiveWeaponPenStats(WeaponPenStats& out) {
     if (idx <= 0) return false;
     void* nw = entity_list.GetClientNetworkable(idx);
     if (!nw) return false;
-    void* cc = VFunc<void*(__fastcall*)(void*)>(nw, 2)(nw);
-    char const* cls = cc ? *reinterpret_cast<char const**>((char*)cc + 16) : nullptr;
+    void* cc = VFunc<void*(THISCALL_CC*)(void*)>(nw, 2)(nw);
+    char const* cls = ClientClassName(cc);
     if (!cls) return false;
 
     // Exact CS:S weapon script + GetBulletTypeParameters values
@@ -863,12 +922,18 @@ bool GetEntityBonePos(int index, int bone, Vector& out) {
     if (index < 1 || index > 64) return false;
     void* entity = entity_list.GetClientEntity(index);
     if (!entity) return false;
-    matrix3x4_t bones[128];
     int count = 0;
-    if (!GetEntityBones(index, entity, bones, &count)) return false;
-    if (bone < 0 || bone >= count) return false;
-    Vector p(bones[bone].m[0][3], bones[bone].m[1][3], bones[bone].m[2][3]);
+    Vector cached_org;
+    const matrix3x4_t* bones = GetEntityBonesPtr(index, entity, &count, &cached_org);
+    if (!bones || bone < 0 || bone >= count) return false;
     Vector origin = *reinterpret_cast<Vector*>((char*)entity + off::m_vecOrigin);
+#ifndef _WIN64
+    Vector p(bones[bone].m[0][3] + (origin.x - cached_org.x),
+             bones[bone].m[1][3] + (origin.y - cached_org.y),
+             bones[bone].m[2][3] + (origin.z - cached_org.z));
+#else
+    Vector p(bones[bone].m[0][3], bones[bone].m[1][3], bones[bone].m[2][3]);
+#endif
     Vector d = p - origin;
     if (sqrtf(d.x * d.x + d.y * d.y + d.z * d.z) > 130.0f) return false;
     out = p;
@@ -1034,7 +1099,7 @@ static void DrawStickSkeleton(ImDrawList* draw, void* entity, int width, int hei
     Vector view = *reinterpret_cast<Vector*>((char*)entity + off::m_vecViewOffset);
     if (!(view.z > 1.0f && view.z < 100.0f)) view.z = 64.0f;
 
-    float yaw = *reinterpret_cast<float*>((char*)entity + 0x434 + 4); // m_angRotation.y
+    float yaw = *reinterpret_cast<float*>((char*)entity + off::m_angRotation + 4); // m_angRotation.y
     Vector fwd, right, up;
     AngleVectors(QAngle(0, yaw, 0), fwd, right, up);
 
@@ -1069,18 +1134,25 @@ static void DrawStickSkeleton(ImDrawList* draw, void* entity, int width, int hei
 static void DrawSkeleton(ImDrawList* draw, void* entity, int index, int width, int height, float alpha,
                          Vector const* offset = nullptr, ImColor const* color = nullptr) {
     SetStage("skeleton SetupBones");
-    matrix3x4_t bones[128];
     int count = 0;
-    if (!GetEntityBones(index, entity, bones, &count)) {
+    Vector cached_org;
+    const matrix3x4_t* bones = GetEntityBonesPtr(index, entity, &count, &cached_org);
+    if (!bones) {
         if (!offset)
             DrawStickSkeleton(draw, entity, width, height, alpha);
         return;
     }
+#ifndef _WIN64
+    Vector const cur_org = *reinterpret_cast<Vector*>((char*)entity + off::m_vecOrigin);
+    Vector const bone_delta = cur_org - cached_org;
+#else
+    Vector const bone_delta(0.0f, 0.0f, 0.0f);
+#endif
 
     auto line_bones = [&](int a, int b) {
         if (a < 0 || b < 0 || a == b || a >= count || b >= count) return;
-        Vector wa(bones[a].m[0][3], bones[a].m[1][3], bones[a].m[2][3]);
-        Vector wb(bones[b].m[0][3], bones[b].m[1][3], bones[b].m[2][3]);
+        Vector wa(bones[a].m[0][3] + bone_delta.x, bones[a].m[1][3] + bone_delta.y, bones[a].m[2][3] + bone_delta.z);
+        Vector wb(bones[b].m[0][3] + bone_delta.x, bones[b].m[1][3] + bone_delta.y, bones[b].m[2][3] + bone_delta.z);
         if (offset) { wa = wa + *offset; wb = wb + *offset; }
         if ((wa.x == 0 && wa.y == 0 && wa.z == 0) || (wb.x == 0 && wb.y == 0 && wb.z == 0))
             return;
@@ -1225,9 +1297,9 @@ static void GetEspWeaponInfo(void* player, EspWeaponInfo& out) {
     const char* model = nullptr;
     void* nw = entity_list.GetClientNetworkable(idx);
     if (nw) {
-        void* cc = VFunc<void*(__fastcall*)(void*)>(nw, 2)(nw);
+        void* cc = VFunc<void*(THISCALL_CC*)(void*)>(nw, 2)(nw);
         if (cc)
-            model = *reinterpret_cast<const char**>((char*)cc + 16);
+            model = ClientClassName(cc);
     }
     strncpy(out.name, WeaponNameFromModel(model), sizeof(out.name) - 1);
     out.clip = *reinterpret_cast<int*>((char*)weapon + off::w_iClip1);
@@ -1502,7 +1574,8 @@ void DrawESP(ImDrawList* draw, int width, int height) {
     for (int i = 1; i <= 64; i++) {
         void* entity = entity_list.GetClientEntity(i);
         if (!entity || entity == local) continue;
-        if (!IsPlayerIndex(i)) continue;
+        player_info_t esp_info = {};
+        if (!engine.GetPlayerInfo(i, &esp_info)) continue;
 
         int team = *reinterpret_cast<int*>((char*)entity + off::m_iTeamNum);
         if (cfg.esp_team_check && local && team == local_team) continue;
@@ -1582,8 +1655,6 @@ void DrawESP(ImDrawList* draw, int width, int height) {
         // (draggable in the menu preview, Players tab).
         // lives for the whole iteration: view.name points into it, so later
         // stack re-use (weapon info etc.) cannot clobber the nickname
-        player_info_t esp_info = {};
-
         esp_layout::PlayerView espv;
         espv.alive = alive;
         espv.gray = gray;
@@ -1593,10 +1664,8 @@ void DrawESP(ImDrawList* draw, int width, int height) {
             espv.health = std::clamp(health / 100.0f, 0.0f, 1.0f);
             espv.armor = std::clamp(*reinterpret_cast<int*>((char*)entity + off::m_ArmorValue), 0, 100);
 
-            if (cfg.esp_name || (!alive && g_last_bounds[i].valid)) {
-                if (engine.GetPlayerInfo(i, &esp_info) && esp_info.name[0])
-                    espv.name = esp_info.name;
-            }
+            if ((cfg.esp_name || (!alive && g_last_bounds[i].valid)) && esp_info.name[0])
+                espv.name = esp_info.name;
 
             if (cfg.esp_distance) {
                 Vector eye;
@@ -1680,20 +1749,19 @@ void DrawESP(ImDrawList* draw, int width, int height) {
             dw_scan = dw_now;
             dw_count = 0;
             int const max_ent = entity_list.GetHighestEntityIndex();
-            for (int i = 1; i <= max_ent && i < 2048 && dw_count < 512; i++) {
-                if (IsPlayerIndex(i)) continue;
+            for (int i = 65; i <= max_ent && i < 2048 && dw_count < 512; i++) {
                 void* e = entity_list.GetClientEntity(i);
                 if (!e) continue;
                 void* nw = entity_list.GetClientNetworkable(i);
                 if (!nw) continue;
-                void* cc = VFunc<void*(__fastcall*)(void*)>(nw, 2)(nw);
-                const char* cls = cc ? *reinterpret_cast<const char**>((char*)cc + 16) : nullptr;
+                void* cc = VFunc<void*(THISCALL_CC*)(void*)>(nw, 2)(nw);
+                const char* cls = ClientClassName(cc);
                 if (!cls) continue;
                 if (strstr(cls, "PlantedC4")) continue;
                 if (!(strstr(cls, "Weapon") || strstr(cls, "Knife") || strstr(cls, "Grenade") ||
                       strcmp(cls, "CC4") == 0))
                     continue;
-                int const owner = *reinterpret_cast<int*>((char*)e + 0x0be0);
+                int const owner = *reinterpret_cast<int*>((char*)e + off::w_hOwner);
                 int const owner_idx = owner & 0xFFF;
                 if (owner_idx > 0 && owner_idx <= 64 && entity_list.GetClientEntity(owner_idx))
                     continue; // held by a player - not dropped
@@ -1711,8 +1779,8 @@ void DrawESP(ImDrawList* draw, int width, int height) {
             if (!e) continue;
             void* nw = entity_list.GetClientNetworkable(i);
             if (!nw) continue;
-            void* cc = VFunc<void*(__fastcall*)(void*)>(nw, 2)(nw);
-            const char* cls = cc ? *reinterpret_cast<const char**>((char*)cc + 16) : nullptr;
+            void* cc = VFunc<void*(THISCALL_CC*)(void*)>(nw, 2)(nw);
+            const char* cls = ClientClassName(cc);
             if (!cls) continue;
 
             Vector const org = *reinterpret_cast<Vector*>((char*)e + off::m_vecOrigin);
@@ -1818,8 +1886,8 @@ void DrawESP(ImDrawList* draw, int width, int height) {
                 if (!e) continue;
                 void* nw = entity_list.GetClientNetworkable(i);
                 if (!nw) continue;
-                void* cc = VFunc<void*(__fastcall*)(void*)>(nw, 2)(nw);
-                const char* cls = cc ? *reinterpret_cast<const char**>((char*)cc + 16) : nullptr;
+                void* cc = VFunc<void*(THISCALL_CC*)(void*)>(nw, 2)(nw);
+                const char* cls = ClientClassName(cc);
                 if (cls && strstr(cls, "PlantedC4"))
                     bombs[n++] = e;
             }
@@ -1832,11 +1900,11 @@ void DrawESP(ImDrawList* draw, int width, int height) {
         for (void* e : bombs) {
             if (!e) continue;
             // Stop drawing once the bomb is defused or has exploded.
-            char const ticking = *reinterpret_cast<char*>((char*)e + 0x0be0);
+            char const ticking = *reinterpret_cast<char*>((char*)e + off::c4_bBombTicking);
             if (!ticking) continue;
 
-            float const blow = *reinterpret_cast<float*>((char*)e + 0x0bec);
-            float const len = *reinterpret_cast<float*>((char*)e + 0x0bf0);
+            float const blow = *reinterpret_cast<float*>((char*)e + off::c4_flC4Blow);
+            float const len = *reinterpret_cast<float*>((char*)e + off::c4_flTimerLength);
             if (!(len > 1.0f && len < 120.0f)) continue;
             float initial = blow - engine.Time();
             if (initial <= 0.0f || initial > len + 1.0f) initial = len;
@@ -1865,75 +1933,95 @@ void DrawESP(ImDrawList* draw, int width, int height) {
             if (remaining <= 0.0f || remaining > len + 1.0f) continue;
 
             // A defuse countdown that has already finished also means done.
-            float const defuse_down = *reinterpret_cast<float*>((char*)e + 0x0bf8);
+            float const defuse_down = *reinterpret_cast<float*>((char*)e + off::c4_flDefuseCountDown);
             if (defuse_down > 0.0f && engine.Time() > defuse_down) continue;
 
             Vector const org = *reinterpret_cast<Vector*>((char*)e + off::m_vecOrigin);
             ImVec2 sp;
-            if (!WorldToScreen(org, sp, width, height)) continue;
+            bool const in_fov = WorldToScreen(org, sp, width, height);
 
-            ImVec2 const mn(sp.x - 29.0f, sp.y - 28.0f);
-            ImVec2 const mx(sp.x + 29.0f, sp.y + 28.0f);
-            draw->AddRectFilled(mn, mx, IM_COL32(2, 2, 2, 240), 6.f);
-            draw->AddRect(mn, mx, IM_COL32(100, 100, 100, 220), 6.f);
-
-            float const white[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
-            ImVec2 const icon_center(sp.x, mn.y + 19.0f);
-            DrawIconText(draw, ImVec2(icon_center.x - 6.0f, icon_center.y - 9.0f),
-                         "o", white, 1.0f);
+            auto draw_bomb_icon = [&](ImVec2 c) {
+                float const white[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+                if (alice::core && alice::core->fonts) {
+                    auto& iconf = alice::core->fonts->get("undefeated");
+                    if (iconf.ptr) {
+                        ImFontGlyph const* g = iconf.ptr->FindGlyph('o');
+                        float const scale = iconf.size / iconf.ptr->FontSize;
+                        float const gx = g ? (g->X0 + g->X1) * 0.5f * scale : 6.0f;
+                        float const gy = g ? (g->Y0 + g->Y1) * 0.5f * scale : 9.0f;
+                        DrawIconText(draw, ImVec2(c.x - gx, c.y - gy), "o", white, 1.0f);
+                    }
+                } else {
+                    draw->AddRectFilled(ImVec2(c.x - 6.0f, c.y - 4.0f),
+                                        ImVec2(c.x + 6.0f, c.y + 5.0f),
+                                        IM_COL32(235, 235, 240, 255), 1.5f);
+                    draw->AddRectFilled(ImVec2(c.x - 3.0f, c.y - 7.0f),
+                                        ImVec2(c.x + 1.0f, c.y - 4.0f),
+                                        IM_COL32(200, 200, 210, 255), 1.0f);
+                    draw->AddCircleFilled(ImVec2(c.x + 2.5f, c.y - 1.0f), 1.6f,
+                                          IM_COL32(255, 75, 75, 255), 10);
+                }
+            };
 
             float const frac = std::clamp(remaining / len, 0.0f, 1.0f);
-            draw->PathArcTo(icon_center, 13.0f, -pi * 0.5f, -pi * 0.5f + 2.0f * pi * frac, 40);
-            draw->PathStroke(IM_COL32(255, 90, 70, 240), 0, 2.0f);
-
             char buf[16];
-            snprintf(buf, sizeof(buf), "%.1f", remaining);
+            snprintf(buf, sizeof(buf), "%.1fs", remaining);
             ImVec2 const ts = ImGui::CalcTextSize(buf);
-            draw->AddText(ImVec2(sp.x - ts.x * 0.5f, icon_center.y + 13.0f + 2.0f),
-                          IM_COL32(255, 120, 100, 255), buf);
+
+            if (in_fov) {
+                float const half_w = 34.0f, half_h = 33.0f;
+                ImVec2 const mn(sp.x - half_w, sp.y - half_h);
+                ImVec2 const mx(sp.x + half_w, sp.y + half_h);
+                for (int gi = 6; gi >= 1; gi--) {
+                    float const ex = gi * 3.0f;
+                    draw->AddRectFilled(ImVec2(mn.x - ex, mn.y - ex), ImVec2(mx.x + ex, mx.y + ex),
+                                        IM_COL32(1, 1, 1, 12 + (6 - gi) * 7), 12.f);
+                }
+                draw->AddRectFilled(mn, mx, IM_COL32(1, 1, 1, 235), 8.f);
+
+                ImVec2 const icon_center(sp.x, mn.y + 23.0f);
+                draw_bomb_icon(icon_center);
+                draw->PathArcTo(icon_center, 15.0f, -pi * 0.5f, -pi * 0.5f + 2.0f * pi * frac, 40);
+                draw->PathStroke(IM_COL32(255, 75, 75, 255), 0, 2.5f);
+
+                draw->AddText(ImVec2(sp.x - ts.x * 0.5f, icon_center.y + 18.0f),
+                              IM_COL32(255, 85, 85, 255), buf);
+            } else {
+                // Out-of-FOV horizontal card positioned at the user-dragged bomb_x/bomb_y
+                float const cw = 144.0f, ch = 62.0f;
+                float const x = std::clamp(cfg.bomb_x, 8.0f, std::max(8.0f, (float)width - cw - 8.0f));
+                float const y = std::clamp(cfg.bomb_y, 8.0f, std::max(8.0f, (float)height - ch - 8.0f));
+
+                ImVec2 const mn(x, y);
+                ImVec2 const mx(x + cw, y + ch);
+                for (int gi = 6; gi >= 1; gi--) {
+                    float const ex = gi * 3.0f;
+                    draw->AddRectFilled(ImVec2(mn.x - ex, mn.y - ex), ImVec2(mx.x + ex, mx.y + ex),
+                                        IM_COL32(1, 1, 1, 12 + (6 - gi) * 7), 12.f);
+                }
+                draw->AddRectFilled(mn, mx, IM_COL32(1, 1, 1, 235), 8.f);
+
+                ImVec2 const icon_center(x + 30.0f, y + ch * 0.5f);
+                draw_bomb_icon(icon_center);
+                draw->PathArcTo(icon_center, 15.0f, -pi * 0.5f, -pi * 0.5f + 2.0f * pi * frac, 40);
+                draw->PathStroke(IM_COL32(255, 75, 75, 255), 0, 2.5f);
+
+                float const tx = x + 60.0f;
+                draw->AddText(ImVec2(tx, y + ch * 0.5f - 15.0f), IM_COL32(245, 245, 250, 255), "Planted");
+                draw->AddText(ImVec2(tx, y + ch * 0.5f + 3.0f), IM_COL32(255, 85, 85, 255), buf);
+            }
         }
     }
 
     last_targets = targets;
 
-    if (frame % 240 == 0) {
+    if (frame == 240) {
         QAngle ea;
         engine.GetViewAngles(ea);
-        Log("esp: targets=%d local=%d time=%.1f eng=%.1f/%.1f setup=%.1f/%.1f eye=%.0f/%.0f/%.0f view=%.0f/%.0f/%.0f fov=%.1f asp=%.3f",
+        Log("esp: targets=%d local=%d time=%.1f eng=%.1f/%.1f setup=%.1f/%.1f fov=%.1f asp=%.3f",
             targets, LocalIndex(), engine.self ? engine.Time() : -1.0f,
             ea.x, ea.y, view_angles.x, view_angles.y,
-            camera_eye.x, camera_eye.y, camera_eye.z, view_origin.x, view_origin.y, view_origin.z,
             view_fov, view_aspect);
-        if (frame % 1200 == 0) for (int i = 1; i <= 8; i++) {
-            void* e = entity_list.GetClientEntity(i);
-            if (!e) { Log("  ent %d: null", i); continue; }
-            char l = *reinterpret_cast<char*>((char*)e + off::m_lifeState);
-            int h = *reinterpret_cast<int*>((char*)e + off::m_iHealth);
-            int t = *reinterpret_cast<int*>((char*)e + off::m_iTeamNum);
-            Vector o = *reinterpret_cast<Vector*>((char*)e + off::m_vecOrigin);
-            Vector vo = *reinterpret_cast<Vector*>((char*)e + off::m_vecViewOffset);
-            int dorm = EntityIsStale(e, i) ? 1 : 0;
-            const char* cls = IsPlayerIndex(i) ? "CCSPlayer" : "?";
-            ImVec2 sp;
-            int ok = WorldToScreen(o, sp, width, height) ? 1 : 0;
-            Log("  ent %d: %p cls=%s player=%d life=%d hp=%d team=%d dormant=%d org=%.0f/%.0f/%.0f vo=%.0f/%.0f/%.0f w2s=%d (%.0f,%.0f)",
-                i, e, cls, IsPlayerIndex(i) ? 1 : 0, (int)l, h, t, dorm, o.x, o.y, o.z, vo.x, vo.y, vo.z, ok, sp.x, sp.y);
-        }
-        if (frame % 600 == 0) {
-            int logged = 0;
-            for (int i = 1; i <= 64 && logged < 3; i++) {
-                if (!IsPlayerIndex(i)) continue;
-                void* e = entity_list.GetClientEntity(i);
-                if (!e) continue;
-                Vector vo = *reinterpret_cast<Vector*>((char*)e + off::m_vecViewOffset);
-                Vector o = *reinterpret_cast<Vector*>((char*)e + off::m_vecOrigin);
-                Vector pt = o + vo;
-                ImVec2 ours(0, 0);
-                bool ok = WorldToScreen(pt, ours, width, height);
-                Log("proj ent %d ok=%d ours=(%.0f,%.0f)", i, ok ? 1 : 0, ours.x, ours.y);
-                logged++;
-            }
-        }
     }
     SetStage("ESP done");
 }
@@ -1960,4 +2048,52 @@ void PeekAssist_Draw(ImDrawList* draw, int width, int height) {
     float const a = std::clamp(cfg.peek_assist_color[3], 0.0f, 1.0f);
     draw->AddConvexPolyFilled(pts, SEGMENTS, IM_COL32(r, g, b, (int)(a * 0.25f * 255.0f)));
     draw->AddPolyline(pts, SEGMENTS, IM_COL32(r, g, b, (int)(a * 255.0f)), ImDrawFlags_Closed, 1.5f);
+}
+
+void Bones_OnFrameStage() {
+#ifndef _WIN64
+    bool const need_bones = cfg.esp_skeleton || cfg.aimbot || cfg.silentaim || cfg.triggerbot;
+    if (!IsGameReady() || (!need_bones && !cfg.backtrack))
+        return;
+    static ULONGLONG s_last_ms = 0;
+    ULONGLONG const now_ms = GetTickCount64();
+    if (now_ms - s_last_ms < 16)
+        return;
+    s_last_ms = now_ms;
+
+    g_bone_frame++;
+    void* local = GetLocalEntity();
+    int const local_team = local ? *reinterpret_cast<const int*>((const char*)local + off::m_iTeamNum) : 0;
+    float const cur_time = engine.Time();
+    for (int i = 1; i <= 64; i++) {
+        void* entity = entity_list.GetClientEntity(i);
+        if (!entity || entity == local) continue;
+        if (!IsPlayerIndex(i)) continue;
+        if (EntityIsStale(entity, i)) continue;
+        char const life = *reinterpret_cast<const char*>((const char*)entity + off::m_lifeState);
+        int const hp = *reinterpret_cast<const int*>((const char*)entity + off::m_iHealth);
+        if (life != 0 || hp <= 0) continue;
+        if (cfg.backtrack && local_team > 0 &&
+            *reinterpret_cast<const int*>((const char*)entity + off::m_iTeamNum) != local_team)
+            Backtrack_Record(i, entity);
+        if (!need_bones) continue;
+        if (cfg.esp_team_check && local_team > 0 &&
+            *reinterpret_cast<const int*>((const char*)entity + off::m_iTeamNum) == local_team)
+            continue;
+
+        void* renderable = reinterpret_cast<char*>(entity) + 4;
+        EnsureSetupBonesFn(renderable);
+        if (!oSetupBones) continue;
+
+        BoneCacheEntry& e = g_bone_cache[i];
+        if (oSetupBones(renderable, e.bones, 128, 0x100, cur_time)) {
+            e.origin = *reinterpret_cast<const Vector*>((const char*)entity + off::m_vecOrigin);
+            e.count = 128;
+            e.renderable = renderable;
+            e.frame = g_bone_frame;
+            e.valid = true;
+            GetBoneMap(entity);
+        }
+    }
+#endif
 }

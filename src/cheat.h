@@ -390,6 +390,19 @@ struct Config {
     bool peek_retreat_on_release = true;
     int peek_max_distance = 0; // 0 = infinite, 1..200 units
     float peek_assist_color[4] = { 1.0f, 0.25f, 0.25f, 1.0f };
+
+    // Scope override (killed/claret style)
+    bool rem_scope = false;
+    bool custom_scope = false;
+    float custom_scope_color[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+    int scope_gap = 10;
+    int scope_length = 100;
+    bool scope_invert = false;
+
+    // Bomb ESP wide/compact state & saved position for out-of-FOV wide card
+    bool bomb_wide_preview = false;
+    float bomb_x = 24.0f;
+    float bomb_y = 260.0f;
 };
 
 extern Config cfg;
@@ -429,6 +442,7 @@ void WorldFx_Install();
 
 void Impacts_OnServerImpact(const Vector& pos, int shooter_index);
 void Impacts_TrackShot();
+bool Impacts_ConsumeFired();
 void Impacts_RecordShot(CUserCmd* cmd, void* local);
 void Impacts_Probe();
 void Tracers_Draw(ImDrawList* draw, int width, int height);
@@ -451,6 +465,7 @@ bool* FeatureBindTarget(int id);
 void ApplyFeatureBinds();
 bool IsGameReady();
 void DrawESP(ImDrawList* draw, int width, int height);
+void Bones_OnFrameStage();
 void PeekAssist_Draw(ImDrawList* draw, int width, int height);
 bool PeekAssist_GetCircle(Vector& out_center);
 void ImguiMenuRender();   // ImGui menu (imgui_menu.cpp)

@@ -16,7 +16,7 @@
 // ---------------------------------------------------------------------------
 
 // ------------------------------ walls --------------------------------------
-typedef void* (__fastcall* FindMaterialFn)(void*, const char*, const char*, bool, const char*);
+TYPEDEF_THISCALL(void*, FindMaterialFn, void*, const char*, const char*, bool, const char*);
 static FindMaterialFn oFindMaterial = nullptr;
 
 // FindMaterial can be called from the material streaming thread while the
@@ -41,6 +41,8 @@ static volatile LONG g_prop_applied = 0;
 // something actually changed instead of every frame
 static float g_wall_color_applied[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
 static float g_prop_color_applied[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+static float g_night_applied = 0.0f;
+static float g_bright_applied = 0.0f;
 static LONG g_wall_count_applied = 0;
 static LONG g_prop_count_applied = 0;
 
@@ -74,12 +76,24 @@ static void WallListAdd(void* mat) {
     LeaveCriticalSection(&g_wall_cs);
 }
 
+static float WorldLightScale() {
+    float s = 1.0f - cfg.world_night * 0.85f + cfg.world_brightness * 0.35f;
+    if (s < 0.05f) s = 0.05f;
+    if (s > 1.5f) s = 1.5f;
+    return s;
+}
+
 static void ApplyWallMaterial(void* mat) {
     if (!mat) return;
     IMaterial m; m.self = mat;
-    if (cfg.world_walls) {
-        m.ColorModulate(cfg.wall_color[0], cfg.wall_color[1], cfg.wall_color[2]);
-        float a = cfg.wall_color[3];
+    bool const mod_light = cfg.world_night > 0.001f || cfg.world_brightness > 0.001f;
+    if (cfg.world_walls || mod_light) {
+        float const ls = WorldLightScale();
+        float const r = (cfg.world_walls ? cfg.wall_color[0] : 1.0f) * ls;
+        float const g = (cfg.world_walls ? cfg.wall_color[1] : 1.0f) * ls;
+        float const b = (cfg.world_walls ? cfg.wall_color[2] : 1.0f) * ls;
+        m.ColorModulate(r, g, b);
+        float a = cfg.world_walls ? cfg.wall_color[3] : 1.0f;
         if (a < 0.05f) a = 0.05f;
         if (a > 1.0f) a = 1.0f;
         m.AlphaModulate(a);
@@ -92,9 +106,14 @@ static void ApplyWallMaterial(void* mat) {
 static void ApplyPropMaterial(void* mat) {
     if (!mat) return;
     IMaterial m; m.self = mat;
-    if (cfg.world_props) {
-        m.ColorModulate(cfg.prop_color[0], cfg.prop_color[1], cfg.prop_color[2]);
-        float a = cfg.prop_color[3];
+    bool const mod_light = cfg.world_night > 0.001f || cfg.world_brightness > 0.001f;
+    if (cfg.world_props || mod_light) {
+        float const ls = WorldLightScale();
+        float const r = (cfg.world_props ? cfg.prop_color[0] : 1.0f) * ls;
+        float const g = (cfg.world_props ? cfg.prop_color[1] : 1.0f) * ls;
+        float const b = (cfg.world_props ? cfg.prop_color[2] : 1.0f) * ls;
+        m.ColorModulate(r, g, b);
+        float a = cfg.world_props ? cfg.prop_color[3] : 1.0f;
         if (a < 0.05f) a = 0.05f;
         if (a > 1.0f) a = 1.0f;
         m.AlphaModulate(a);
@@ -104,16 +123,16 @@ static void ApplyPropMaterial(void* mat) {
     }
 }
 
-static void* __fastcall HookedFindMaterial(void* self, const char* name, const char* group,
+static HOOK_THISCALL(void*, HookedFindMaterial, void*, const char* name, const char* group,
                                            bool complain, const char* prefix) {
     void* mat = oFindMaterial ? oFindMaterial(self, name, group, complain, prefix) : nullptr;
-    if (mat && group && name) {
+    if (mat && name) {
         // collect only - colours are applied from WorldFx_ApplyWalls on the
         // render thread.  Touching material vars from inside FindMaterial
         // (possibly under the material system's own lock) was the deadlock.
-        if (strstr(group, "World") && !strstr(name, "models/player"))
+        if (group && strstr(group, "World") && !strstr(name, "models/player"))
             WallListAdd(mat);
-        if (strstr(name, "models/props"))
+        if ((group && strstr(group, "StaticProp")) || strstr(name, "props") || strstr(name, "Props"))
             PropListAdd(mat);
     }
     return mat;
@@ -126,24 +145,31 @@ void WorldFx_Install() {
         g_wall_cs_ready = true;
     }
     void** vt = *reinterpret_cast<void***>(material_system.self);
-    if (!vt || !vt[121]) { Log("[worldfx] FindMaterial slot missing"); return; }
-    oFindMaterial = reinterpret_cast<FindMaterialFn>(vt[121]);
+#ifdef _WIN64
+    constexpr int FIND_MATERIAL_IDX = 121;
+#else
+    constexpr int FIND_MATERIAL_IDX = 27;
+#endif
+    if (!vt || !vt[FIND_MATERIAL_IDX]) { Log("[worldfx] FindMaterial slot missing"); return; }
+    oFindMaterial = reinterpret_cast<FindMaterialFn>(vt[FIND_MATERIAL_IDX]);
     DWORD old = 0;
-    if (VirtualProtect(&vt[121], sizeof(void*), PAGE_READWRITE, &old)) {
-        vt[121] = reinterpret_cast<void*>(&HookedFindMaterial);
-        VirtualProtect(&vt[121], sizeof(void*), old, &old);
-        Log("[worldfx] FindMaterial hooked, %p", (void*)vt[121]);
+    if (VirtualProtect(&vt[FIND_MATERIAL_IDX], sizeof(void*), PAGE_READWRITE, &old)) {
+        vt[FIND_MATERIAL_IDX] = reinterpret_cast<void*>(&HookedFindMaterial);
+        VirtualProtect(&vt[FIND_MATERIAL_IDX], sizeof(void*), old, &old);
+        Log("[worldfx] FindMaterial hooked, %p", (void*)vt[FIND_MATERIAL_IDX]);
     }
 }
 
 void WorldFx_ApplyWalls() {
     if (!g_wall_cs_ready) return;
 
-    LONG const want_wall = cfg.world_walls ? 1 : 0;
-    LONG const want_prop = cfg.world_props ? 1 : 0;
+    bool const mod_light = cfg.world_night > 0.001f || cfg.world_brightness > 0.001f;
+    LONG const want_wall = (cfg.world_walls || mod_light) ? 1 : 0;
+    LONG const want_prop = (cfg.world_props || mod_light) ? 1 : 0;
     bool const wall_dirty = want_wall != (LONG)g_wall_applied;
     bool const prop_dirty = want_prop != (LONG)g_prop_applied;
-    if (!wall_dirty && !prop_dirty && !want_wall && !want_prop) return;
+    bool const light_dirty = (cfg.world_night != g_night_applied) || (cfg.world_brightness != g_bright_applied);
+    if (!wall_dirty && !prop_dirty && !light_dirty && !want_wall && !want_prop) return;
 
     // snapshot the lists under the lock, then call into the material system
     // with the lock released (no lock-order inversion with FindMaterial)
@@ -171,10 +197,14 @@ void WorldFx_ApplyWalls() {
 
     if (wall_dirty) g_wall_applied = want_wall;
     if (prop_dirty) g_prop_applied = want_prop;
+    if (light_dirty) {
+        g_night_applied = cfg.world_night;
+        g_bright_applied = cfg.world_brightness;
+    }
 
-    if (wall_dirty || wall_color || wall_list)
+    if (wall_dirty || wall_color || wall_list || light_dirty)
         for (LONG i = 0; i < wall_count; i++) ApplyWallMaterial(walls[i]);
-    if (prop_dirty || prop_color || prop_list)
+    if (prop_dirty || prop_color || prop_list || light_dirty)
         for (LONG i = 0; i < prop_count; i++) ApplyPropMaterial(props[i]);
 
     if (wall_dirty || wall_color || wall_list) {

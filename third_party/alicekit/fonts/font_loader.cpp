@@ -517,11 +517,25 @@ void c_font_loader::clear_runtime_state( )
     memset( m_shadow_rect_uvs, 0, sizeof( m_shadow_rect_uvs ) );
 }
 
-void c_font_loader::release( )
+void c_font_loader::release_gpu( )
 {
     if ( m_srv && alice::core && alice::core->backend )
         alice::core->backend->destroy_texture( m_srv );
     m_srv = 0;
 
+    if ( ImGui::GetCurrentContext( ) )
+    {
+        ImFontAtlas* atlas = ImGui::GetIO( ).Fonts;
+        if ( atlas )
+        {
+            atlas->TexID = 0;
+            atlas->TexReady = false;
+        }
+    }
+}
+
+void c_font_loader::release( )
+{
+    release_gpu( );
     clear_runtime_state( );
 }

@@ -2,16 +2,10 @@
 set -e
 cd "$(dirname "$0")"
 
-if [ -z "$CXX" ]; then
-    if command -v x86_64-w64-mingw32-g++ >/dev/null 2>&1; then
-        CXX=x86_64-w64-mingw32-g++
-    elif [ -x /opt/homebrew/bin/x86_64-w64-mingw32-g++ ]; then
-        CXX=/opt/homebrew/bin/x86_64-w64-mingw32-g++
-    else
-        echo "error: x86_64-w64-mingw32-g++ not found (set CXX or install mingw-w64)" >&2
-        exit 1
-    fi
-fi
+TARGET="${1:-all}"
+
+CXX64="${CXX64:-$(command -v x86_64-w64-mingw32-g++ || echo /opt/homebrew/bin/x86_64-w64-mingw32-g++)}"
+CXX32="${CXX32:-$(command -v i686-w64-mingw32-g++ || echo /opt/homebrew/bin/i686-w64-mingw32-g++)}"
 
 AK=third_party/alicekit
 IMGUI=$AK/imgui
@@ -24,8 +18,6 @@ fi
 
 BASEFLAGS="-std=c++20 -O2 -fno-exceptions -DNDEBUG -DWIN32_LEAN_AND_MEAN -DNOMINMAX"
 INCLUDES="-Isrc -I$IMGUI -I$IMGUI/backends -I$AK"
-
-mkdir -p build/obj
 
 AK_SRC="\
     $AK/alice_kit.cpp \
@@ -54,20 +46,16 @@ AK_SRC="\
     $AK/backends/dx9/blur/blur.cpp \
     $AK/backends/dx9/grayscale/grayscale.cpp"
 
-OBJS=""
-for src in $AK_SRC; do
-    obj="build/obj/$(echo "$src" | sed 's#[^a-zA-Z0-9]#_#g').o"
-    rebuild=0
-    if [ ! -f "$obj" ] || [ "$src" -nt "$obj" ]; then
-        rebuild=1
-    elif [ -n "$(find "$AK" -name '*.hpp' -newer "$obj" -print -quit 2>/dev/null)" ]; then
-        rebuild=1
-    fi
-    if [ "$rebuild" = 1 ]; then
-        $CXX $BASEFLAGS -c "$src" -o "$obj" $INCLUDES
-    fi
-    OBJS="$OBJS $obj"
-done
+CHEAT_SRC="\
+    src/main.cpp src/hooks.cpp src/features.cpp src/crash.cpp \
+    src/alice_ui.cpp src/server_list.cpp src/connect_fix.cpp src/http_winhttp.cpp \
+    src/impacts.cpp src/visual_fx.cpp src/game_events.cpp src/grenades.cpp \
+    src/imgui_menu.cpp src/esp_layout.cpp src/glb_preview.cpp src/precache.cpp \
+    build/glb_data.cpp \
+    $IMGUI/imgui.cpp $IMGUI/imgui_draw.cpp $IMGUI/imgui_tables.cpp $IMGUI/imgui_widgets.cpp \
+    $IMGUI/backends/imgui_impl_win32.cpp $IMGUI/backends/imgui_impl_dx9.cpp"
+
+LIBS="-ld3d9 -luser32 -lgdi32 -ldwmapi -limm32 -ldbghelp -lwininet -lwinhttp -lws2_32 -lpsapi -static -Wl,--enable-stdcall-fixup"
 
 mkdir -p build
 
@@ -92,18 +80,56 @@ print('const unsigned int g_glb_model_size = %d;' % len(data))
 PY
 fi
 
-echo "[1/2] islamware.dll"
-$CXX $BASEFLAGS -shared -o build/islamware.dll \
-    src/main.cpp src/hooks.cpp src/features.cpp src/crash.cpp src/alice_ui.cpp src/server_list.cpp src/connect_fix.cpp src/http_winhttp.cpp src/impacts.cpp src/visual_fx.cpp src/game_events.cpp src/grenades.cpp src/imgui_menu.cpp src/esp_layout.cpp src/glb_preview.cpp src/precache.cpp build/glb_data.cpp \
-    "$IMGUI/imgui.cpp" "$IMGUI/imgui_draw.cpp" "$IMGUI/imgui_tables.cpp" "$IMGUI/imgui_widgets.cpp" \
-    "$IMGUI/backends/imgui_impl_win32.cpp" "$IMGUI/backends/imgui_impl_dx9.cpp" \
-    $OBJS \
-    $INCLUDES \
-    -ld3d9 -luser32 -lgdi32 -ldwmapi -limm32 -ldbghelp -lwininet -lwinhttp -lws2_32 -lpsapi \
-    -static -Wl,--enable-stdcall-fixup
+build_arch() {
+    local arch="$1"
+    local cxx="$2"
+    local dll_name="$3"
+    local inj_name="$4"
+    local objdir="build/obj/$arch"
 
-echo "[2/2] injector.exe"
-$CXX -std=c++17 -O2 -o build/injector.exe injector/main.cpp \
-    -luser32 -static
+    if [ ! -x "$cxx" ] && ! command -v "$cxx" >/dev/null 2>&1; then
+        echo "error: $cxx not found (install mingw-w64)" >&2
+        exit 1
+    fi
+
+    mkdir -p "$objdir"
+    local objs=""
+    for src in $AK_SRC; do
+        local obj="$objdir/$(echo "$src" | sed 's#[^a-zA-Z0-9]#_#g').o"
+        local rebuild=0
+        if [ ! -f "$obj" ] || [ "$src" -nt "$obj" ]; then
+            rebuild=1
+        elif [ -n "$(find "$AK" -name '*.hpp' -newer "$obj" -print -quit 2>/dev/null)" ]; then
+            rebuild=1
+        fi
+        if [ "$rebuild" = 1 ]; then
+            "$cxx" $BASEFLAGS -c "$src" -o "$obj" $INCLUDES
+        fi
+        objs="$objs $obj"
+    done
+
+    echo "[$arch 1/2] $dll_name"
+    "$cxx" $BASEFLAGS -shared -o "build/$dll_name" $CHEAT_SRC $objs $INCLUDES $LIBS
+
+    echo "[$arch 2/2] $inj_name"
+    "$cxx" -std=c++17 -O2 -o "build/$inj_name" injector/main.cpp -luser32 -static
+}
+
+case "$TARGET" in
+    x64)
+        build_arch "x64" "$CXX64" "islamware.dll" "injector.exe"
+        ;;
+    v34)
+        build_arch "v34" "$CXX32" "islamware_v34.dll" "injector_v34.exe"
+        ;;
+    all)
+        build_arch "x64" "$CXX64" "islamware.dll" "injector.exe"
+        build_arch "v34" "$CXX32" "islamware_v34.dll" "injector_v34.exe"
+        ;;
+    *)
+        echo "usage: $0 [all|x64|v34]" >&2
+        exit 1
+        ;;
+esac
 
 ls -la build

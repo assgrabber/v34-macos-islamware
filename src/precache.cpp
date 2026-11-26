@@ -19,6 +19,7 @@
 namespace {
 
 constexpr uintptr_t CLIENT_SET_MODEL_INDEX_RVA = 0x8D670;
+constexpr uintptr_t CLIENT_SET_MODEL_INDEX_V34_RVA = 0x48EF0;
 constexpr uintptr_t CLIENT_GET_MODEL_PTR_RVA   = 0x751A0;
 constexpr uintptr_t CLIENT_LOOKUP_SEQUENCE_RVA = 0x77B70;
 constexpr uintptr_t CLIENT_STUDIO_NUM_SEQ_RVA  = 0x1A6BC0;
@@ -339,7 +340,8 @@ static int ResolveClientModelIndex(const char* path) {
         return 0;
     }
 
-    // 3. Register client-side dynamic model through IVModelInfo::RegisterDynamicModel
+    // 3. Register client-side model
+#ifdef _WIN64
     int const dyn_idx = model_info.RegisterDynamicModel(path, true);
     if (dyn_idx >= -1) {
         g_cached_failed = true;
@@ -370,10 +372,38 @@ static int ResolveClientModelIndex(const char* path) {
     snprintf(g_model_status, sizeof(g_model_status), "Active (client #%d)", dyn_idx);
     Log("[model] RegisterDynamicModel('%s') -> %d (mdl=%p hdr=%p)", path, dyn_idx, mdl, hdr);
     return dyn_idx;
+#else
+    // On v34 (Source 2006), precache loose models via VEngineClientStringTable001 ("modelprecache")
+    static void* s_str_tables = nullptr;
+    static bool s_str_tables_checked = false;
+    if (!s_str_tables_checked) {
+        s_str_tables_checked = true;
+        s_str_tables = GetInterface(GetModuleHandleA("engine.dll"), "VEngineClientStringTable001");
+    }
+    if (s_str_tables) {
+        void* tbl = VFunc<void*(THISCALL_CC*)(void*, const char*)>(s_str_tables, 3)(s_str_tables, "modelprecache");
+        if (tbl) {
+            // Source 2006 INetworkStringTable::AddString(const char*, int len = -1, const void* userdata = 0)
+            VFunc<int(THISCALL_CC*)(void*, const char*, int, const void*)>(tbl, 8)(tbl, path, -1, nullptr);
+            int const new_idx = model_info.GetModelIndex(path);
+            if (new_idx > 0) {
+                g_cached_index = new_idx;
+                snprintf(g_model_status, sizeof(g_model_status), "Active (v34 #%d)", new_idx);
+                Log("[model] v34 precached '%s' -> %d", path, new_idx);
+                return new_idx;
+            }
+        }
+    }
+    g_cached_failed = true;
+    snprintf(g_model_status, sizeof(g_model_status), "Not precached on v34");
+    Log("[model] v34 failed to precache '%s'", path);
+    return 0;
+#endif
 }
 
 static void ApplyEntityModelIndex(void* entity, int index) {
     if (!entity || !client_module || index == 0 || index == -1) return;
+#ifdef _WIN64
     typedef void(__fastcall* SetModelIndexFn)(void*, int);
     auto set_model_index = reinterpret_cast<SetModelIndexFn>(
         (uintptr_t)client_module + CLIENT_SET_MODEL_INDEX_RVA);
@@ -381,9 +411,22 @@ static void ApplyEntityModelIndex(void* entity, int index) {
     mdl_cache.BeginLock();
     set_model_index(entity, index);
     mdl_cache.EndLock();
+#else
+    typedef void(THISCALL_CC* SetModelIndexFn)(void*, int);
+    auto set_model_index = reinterpret_cast<SetModelIndexFn>(
+        (uintptr_t)client_module + CLIENT_SET_MODEL_INDEX_V34_RVA);
+
+    mdl_cache.BeginLock();
+    set_model_index(entity, index);
+    mdl_cache.EndLock();
+#endif
 }
 
 static bool BuildSequenceRemap(void* entity, int16_t orig_idx, int custom_idx) {
+#ifndef _WIN64
+    (void)entity; (void)orig_idx; (void)custom_idx;
+    return false;
+#else
     if (!entity || !client_module || orig_idx <= 0 || custom_idx == 0 || custom_idx == -1)
         return false;
     if (g_remap_orig_idx == orig_idx && g_remap_custom_idx == custom_idx && !g_seq_remap.empty())
@@ -471,6 +514,7 @@ static bool BuildSequenceRemap(void* entity, int16_t orig_idx, int custom_idx) {
         orig_labels.size() > 0 ? orig_labels[0].c_str() : "?", g_seq_remap.size() > 0 ? g_seq_remap[0] : -1,
         orig_labels.size() > 1 ? orig_labels[1].c_str() : "?", g_seq_remap.size() > 1 ? g_seq_remap[1] : -1);
     return true;
+#endif
 }
 
 static int RemapSequenceIndex(int orig_seq) {
@@ -545,9 +589,9 @@ void ClientModel_OnFrameStage(int stage) {
         model_ent = local;
         model_slot = engine.GetLocalPlayer();
     } else {
-        int const obs_mode = *reinterpret_cast<const int*>((const char*)local + 0x15dc);
+        int const obs_mode = *reinterpret_cast<const int*>((const char*)local + off::m_iObserverMode);
         if (obs_mode == 4 || obs_mode == 5) {
-            int const h = *reinterpret_cast<const int*>((const char*)local + 0x15e0);
+            int const h = *reinterpret_cast<const int*>((const char*)local + off::m_hObserverTarget);
             int const idx = (h != -1) ? (h & 0xFFF) : 0;
             if (idx > 0 && idx <= 64) {
                 void* obs = entity_list.GetClientEntity(idx);

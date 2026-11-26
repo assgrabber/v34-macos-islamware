@@ -23,6 +23,7 @@ namespace alice
         ImTextureID get( std::string const& key );
 
         void load_premade( );
+        void release( );
         void init_loader( std::function< void( void const* data, size_t data_size, ImTextureID* out, bool pixel_perfect ) > const& load_fn );
     };
 } // namespace alice

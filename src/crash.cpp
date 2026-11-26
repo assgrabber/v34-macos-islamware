@@ -94,6 +94,7 @@ static LONG WINAPI UnhandledFilter(EXCEPTION_POINTERS* info) {
             info->ExceptionRecord->ExceptionInformation[0] ? "write" : "read",
             (void*)info->ExceptionRecord->ExceptionInformation[1]);
     }
+#ifdef _WIN64
     CrashWrite("rax=%016llx rbx=%016llx rcx=%016llx rdx=%016llx",
         (unsigned long long)ctx->Rax, (unsigned long long)ctx->Rbx,
         (unsigned long long)ctx->Rcx, (unsigned long long)ctx->Rdx);
@@ -111,6 +112,19 @@ static LONG WINAPI UnhandledFilter(EXCEPTION_POINTERS* info) {
     // return addresses from the stack
     CrashWrite("stack:");
     uintptr_t* sp = (uintptr_t*)ctx->Rsp;
+#else
+    CrashWrite("eax=%08lx ebx=%08lx ecx=%08lx edx=%08lx",
+        (unsigned long)ctx->Eax, (unsigned long)ctx->Ebx,
+        (unsigned long)ctx->Ecx, (unsigned long)ctx->Edx);
+    CrashWrite("esi=%08lx edi=%08lx ebp=%08lx esp=%08lx eip=%08lx",
+        (unsigned long)ctx->Esi, (unsigned long)ctx->Edi,
+        (unsigned long)ctx->Ebp, (unsigned long)ctx->Esp,
+        (unsigned long)ctx->Eip);
+
+    // return addresses from the stack
+    CrashWrite("stack:");
+    uintptr_t* sp = (uintptr_t*)ctx->Esp;
+#endif
     for (int i = 0; i < 32 && sp; i++) {
         uintptr_t v = 0;
         SIZE_T got = 0;

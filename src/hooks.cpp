@@ -41,8 +41,16 @@ static bool PatchVtable(void** vt, int index, void* fn, void** original) {
 
 static void* GetInput() {
     if (!client_module) return nullptr;
+#ifdef _WIN64
     // 0x5C0090 holds the CInput* (the object itself lives at client.dll+0x691CB0)
     return *reinterpret_cast<void**>((char*)client_module + CLIENT_INPUT_GLOBAL_RVA);
+#else
+    if (!base_client) return nullptr;
+    static void* s_input = nullptr;
+    if (!s_input)
+        s_input = **reinterpret_cast<void***>((*reinterpret_cast<uintptr_t**>(base_client))[11] + 0x2);
+    return s_input;
+#endif
 }
 
 static bool KeyActive(int vk) {
@@ -292,8 +300,8 @@ static int CurrentWeaponGroup( ) {
     cached_handle = handle;
     void* w = entity_list.GetClientEntity( idx );
     void* nw = w ? entity_list.GetClientNetworkable( idx ) : nullptr;
-    void* cc = nw ? VFunc<void*( __fastcall* )( void* )>( nw, 2 )( nw ) : nullptr;
-    char const* cls = cc ? *reinterpret_cast<char const**>( (char*)cc + 16 ) : nullptr;
+    void* cc = nw ? VFunc<void*(THISCALL_CC*)(void*)>(nw, 2)(nw) : nullptr;
+    char const* cls = ClientClassName(cc);
     int g = 0;
     if ( cls ) {
         if ( strstr( cls, "Knife" ) ) g = 6;
@@ -381,28 +389,31 @@ static QAngle LerpAngle(const QAngle& from, const QAngle& to, float t) {
 static bool g_world_needs_cheats = false;
 
 static void ForceSvCheats() {
+#ifndef _WIN64
+    // On v34, CmdSet clears FCVAR_CHEAT and calls ConVar::SetValue directly,
+    // and forcing sv_cheats = 1 causes native CAM_ToThirdPerson/CAM_Think to
+    // fight with our OverrideView third-person camera.
+    return;
+#else
     static ConVar* sc = nullptr;
-    static bool ready = false;
     static int original = -1;
-    if (!ready) {
-        ready = true;
-        if (cvar.self) sc = cvar.FindVar("sv_cheats");
-    }
+    if (!sc && cvar.self)
+        sc = cvar.FindVar("sv_cheats");
     if (!sc) return;
 
-    int* value = reinterpret_cast<int*>((char*)sc + 0x58);
     bool const want = cfg.thirdperson || g_world_needs_cheats;
     if (want) {
-        if (original < 0) original = *value;
+        if (original < 0) original = sc->i_value;
         sc->f_value = 1.0f;
         sc->i_value = 1;
-        *value = 1;
+        *reinterpret_cast<int*>((char*)sc + 0x58) = 1;
     } else if (original >= 0) {
         sc->f_value = original ? 1.0f : 0.0f;
         sc->i_value = original;
-        *value = original;
+        *reinterpret_cast<int*>((char*)sc + 0x58) = original;
         original = -1;
     }
+#endif
 }
 
 static bool LocalCanThirdPerson() {
@@ -410,7 +421,7 @@ static bool LocalCanThirdPerson() {
     void* local = GetLocalEntity();
     if (!local) return false;
     if (*reinterpret_cast<const char*>((const char*)local + off::m_lifeState) != 0) return false;
-    if (*reinterpret_cast<const int*>((const char*)local + 0x15dc) != 0) return false; // m_iObserverMode
+    if (*reinterpret_cast<const int*>((const char*)local + off::m_iObserverMode) != 0) return false; // m_iObserverMode
     return true;
 }
 
@@ -419,9 +430,9 @@ static void* GetSpectatedPlayer() {
     void* local = GetLocalEntity();
     if (!local) return nullptr;
     if (*reinterpret_cast<const char*>((const char*)local + off::m_lifeState) == 0) return nullptr;
-    int const obs_mode = *reinterpret_cast<const int*>((const char*)local + 0x15dc);
+    int const obs_mode = *reinterpret_cast<const int*>((const char*)local + off::m_iObserverMode);
     if (obs_mode != 4 /* OBS_MODE_IN_EYE */ && obs_mode != 5 /* OBS_MODE_CHASE */) return nullptr;
-    int const h = *reinterpret_cast<const int*>((const char*)local + 0x15e0); // m_hObserverTarget
+    int const h = *reinterpret_cast<const int*>((const char*)local + off::m_hObserverTarget); // m_hObserverTarget
     if (h == -1) return nullptr;
     int const idx = h & 0xFFF;
     if (idx <= 0 || idx > 64 || !IsPlayerIndex(idx)) return nullptr;
@@ -445,12 +456,12 @@ static void UpdateThirdPerson() {
         // actual camera position/distance is overridden in OverrideView so the
         // slider is authoritative even when sv_cheats is 0.
         if (!active) {
-            auto fn = VFunc<void(__fastcall*)(void*)>(input, INPUT_CAM_TO_THIRD);
+            auto fn = VFunc<void(THISCALL_CC*)(void*)>(input, INPUT_CAM_TO_THIRD);
             fn(input);
         }
         *reinterpret_cast<uint8_t*>((char*)input + INPUT_CAM_THIRD_PERSON) = 1;
     } else if (active) {
-        auto fn = VFunc<void(__fastcall*)(void*)>(input, INPUT_CAM_TO_FIRST);
+        auto fn = VFunc<void(THISCALL_CC*)(void*)>(input, INPUT_CAM_TO_FIRST);
         fn(input);
         *reinterpret_cast<uint8_t*>((char*)input + INPUT_CAM_THIRD_PERSON) = 0;
     }
@@ -459,14 +470,14 @@ static void UpdateThirdPerson() {
 // ---------------------------------------------------------------------------
 // movement / combat
 // ---------------------------------------------------------------------------
-typedef bool(__fastcall* CreateMoveFn)(void*, float, CUserCmd*);
-typedef void(__fastcall* OverrideViewFn)(void*, CViewSetup*);
-typedef bool(__fastcall* ShouldDrawLocalPlayerFn)(void*, void*);
+TYPEDEF_THISCALL(bool, CreateMoveFn, void*, float, CUserCmd*);
+TYPEDEF_THISCALL(void, OverrideViewFn, void*, CViewSetup*);
+TYPEDEF_THISCALL(bool, ShouldDrawLocalPlayerFn, void*, void*);
 
 static CreateMoveFn oCreateMove = nullptr;
 static OverrideViewFn oOverrideView = nullptr;
 static ShouldDrawLocalPlayerFn oShouldDrawLocalPlayer = nullptr;
-typedef bool(__fastcall* ShouldDrawViewModelFn)(void*);
+TYPEDEF_THISCALL(bool, ShouldDrawViewModelFn, void*);
 static ShouldDrawViewModelFn oShouldDrawViewModel = nullptr;
 
 static int AimKeyDown() {
@@ -487,6 +498,7 @@ static void* GetActiveWeapon(void* local) {
 }
 
 static float GetIntervalPerTick() {
+#ifdef _WIN64
     if (client_module) {
         void* globals = *reinterpret_cast<void**>((char*)client_module + CLIENT_GLOBALS_RVA);
         if (globals) {
@@ -494,6 +506,17 @@ static float GetIntervalPerTick() {
             if (ipt > 0.001f && ipt < 0.2f) return ipt;
         }
     }
+#else
+    if (base_client) {
+        static void* s_globals = nullptr;
+        if (!s_globals)
+            s_globals = **reinterpret_cast<void***>((*reinterpret_cast<uintptr_t**>(base_client))[0] + 0x2F);
+        if (s_globals) {
+            float const ipt = *reinterpret_cast<const float*>((const char*)s_globals + 0x1c);
+            if (ipt > 0.001f && ipt < 0.2f) return ipt;
+        }
+    }
+#endif
     return 1.0f / 66.666666f;
 }
 
@@ -517,15 +540,132 @@ static float GetLerpTime() {
 // CWeaponCSBase in x64 client.dll (build 9540945):
 //   [382] +0xbf0 = GetInaccuracy(), [383] +0xbf8 = GetSpread()
 static float WeaponGetInaccuracy(void* weapon) {
+#ifdef _WIN64
     if (!weapon) return 0.0f;
-    float const v = VFunc<float(__fastcall*)(void*)>(weapon, 382)(weapon);
+    float const v = VFunc<float(THISCALL_CC*)(void*)>(weapon, 382)(weapon);
     return (v == v && v > 0.0f && v < 1.0f) ? v : 0.0f;
+#else
+    (void)weapon;
+    return 0.0f;
+#endif
 }
 
 static float WeaponGetSpread(void* weapon) {
+#ifdef _WIN64
     if (!weapon) return 0.0f;
-    float const v = VFunc<float(__fastcall*)(void*)>(weapon, 383)(weapon);
+    float const v = VFunc<float(THISCALL_CC*)(void*)>(weapon, 383)(weapon);
     return (v == v && v > 0.0f && v < 1.0f) ? v : 0.0f;
+#else
+    if (!weapon) return 0.0f;
+    void* local = GetLocalEntity();
+    if (!local) return 0.0f;
+
+    // CWeaponCSBase::GetWeaponID() is vtable slot 297 (0x4a4 / 4) in v34 client.dll
+    int const wid = VFunc<int(THISCALL_CC*)(void*)>(weapon, 297)(weapon);
+    float acc = *reinterpret_cast<float*>((char*)weapon + off::w_flAccuracy);
+    if (!(acc == acc) || acc < 0.0f || acc > 2.5f) acc = 0.2f;
+
+    int const flags = *reinterpret_cast<int*>((char*)local + off::m_fFlags);
+    bool const on_ground = (flags & FL_ONGROUND) != 0;
+    bool const ducking = (flags & FL_DUCKING) != 0;
+    Vector const vel = *reinterpret_cast<Vector*>((char*)local + off::m_vecVelocity);
+    float const speed = sqrtf(vel.x * vel.x + vel.y * vel.y);
+    int const fov = *reinterpret_cast<int*>((char*)local + off::m_iFOV);
+    bool const zoomed = (fov > 0 && fov < 90);
+
+    // Exact CS:S v34 (Source 2006) per-weapon PrimaryAttack spread formulas
+    switch (wid) {
+    case 27: // AK47
+        if (!on_ground) return 0.04f + 0.4f * acc;
+        if (speed > 140.0f) return 0.04f + 0.07f * acc;
+        return 0.0275f * acc;
+    case 21: // M4A1 (unsilenced)
+        if (!on_ground) return 0.035f + 0.4f * acc;
+        if (speed > 140.0f) return 0.035f + 0.07f * acc;
+        return 0.02f * acc;
+    case 25: // DEagle
+        if (!on_ground) return 1.5f * (1.0f - acc);
+        if (speed > 5.0f) return 0.25f * (1.0f - acc);
+        if (ducking) return 0.115f * (1.0f - acc);
+        return 0.13f * (1.0f - acc);
+    case 17: // AWP
+        if (!on_ground) return 0.85f;
+        if (speed > 140.0f) return 0.25f;
+        if (speed > 10.0f) return 0.10f;
+        if (ducking) return zoomed ? 0.0f : 0.08f;
+        return zoomed ? 0.001f : 0.08f;
+    case 3: // Scout
+        if (!on_ground) return 0.2f;
+        if (speed > 170.0f) return 0.075f;
+        if (ducking) return zoomed ? 0.0f : 0.025f;
+        return zoomed ? 0.007f : 0.032f;
+    case 13: // SG550
+    case 23: // G3SG1
+        if (!on_ground) return 0.45f * (1.0f - acc);
+        if (speed > 5.0f) return 0.15f;
+        if (ducking) return (zoomed ? 0.0f : 0.025f) + 0.04f * (1.0f - acc);
+        return (zoomed ? 0.0f : 0.025f) + 0.05f * (1.0f - acc);
+    case 16: // USP
+        if (!on_ground) return 1.2f * (1.0f - acc);
+        if (speed > 5.0f) return 0.225f * (1.0f - acc);
+        if (ducking) return 0.08f * (1.0f - acc);
+        return 0.1f * (1.0f - acc);
+    case 2: // Glock
+        if (!on_ground) return 1.0f * (1.0f - acc);
+        if (speed > 5.0f) return 0.165f * (1.0f - acc);
+        if (ducking) return 0.075f * (1.0f - acc);
+        return 0.1f * (1.0f - acc);
+    case 1: // P228
+        if (!on_ground) return 1.5f * (1.0f - acc);
+        if (speed > 5.0f) return 0.255f * (1.0f - acc);
+        if (ducking) return 0.075f * (1.0f - acc);
+        return 0.15f * (1.0f - acc);
+    case 11: // FiveSeven
+    case 10: // Elite
+        if (!on_ground) return 1.5f * (1.0f - acc);
+        if (speed > 5.0f) return 0.255f * (1.0f - acc);
+        if (ducking) return 0.075f * (1.0f - acc);
+        return 0.15f * (1.0f - acc);
+    case 14: // Galil
+        if (!on_ground) return 0.04f + 0.3f * acc;
+        if (speed > 140.0f) return 0.04f + 0.07f * acc;
+        return 0.0375f * acc;
+    case 15: // Famas
+        if (!on_ground) return 0.03f + 0.3f * acc;
+        if (speed > 140.0f) return 0.03f + 0.07f * acc;
+        return 0.02f * acc;
+    case 8:  // AUG
+    case 26: // SG552
+        if (!on_ground) return 0.035f + 0.4f * acc;
+        if (speed > 140.0f) return 0.035f + 0.07f * acc;
+        return 0.02f * acc;
+    case 18: // MP5
+        if (!on_ground) return 0.2f * acc;
+        return 0.04f * acc;
+    case 29: // P90
+        if (!on_ground) return 0.3f * acc;
+        if (speed > 170.0f) return 0.115f * acc;
+        return 0.045f * acc;
+    case 12: // UMP45
+        if (!on_ground) return 0.24f * acc;
+        return 0.04f * acc;
+    case 7:  // MAC10
+        if (!on_ground) return 0.375f * acc;
+        return 0.03f * acc;
+    case 22: // TMP
+        if (!on_ground) return 0.25f * acc;
+        return 0.03f * acc;
+    case 19: // M249
+        if (!on_ground) return 0.045f + 0.5f * acc;
+        if (speed > 140.0f) return 0.045f + 0.095f * acc;
+        return 0.03f * acc;
+    case 20: // M3
+    case 5:  // XM1014
+        return 0.0675f;
+    default:
+        return 0.0f;
+    }
+#endif
 }
 
 static bool WeaponCanFire(void* local) {
@@ -557,12 +697,18 @@ static float ComputeHitChance(void* weapon, float dist, int hitbox) {
         return (float)(rng >> 8) * (1.0f / 16777216.0f);
     };
     for (int s = 0; s < 32; s++) {
+#ifdef _WIN64
         float const a = two_pi * next_u();
         float const b = inacc * next_u();
         float const c = two_pi * next_u();
         float const d = spread * next_u();
         float const sx = cosf(a) * b + cosf(c) * d;
         float const sy = sinf(a) * b + sinf(c) * d;
+#else
+        // v34 FX_FireBullets triangular spread: (RandomFloat(-0.5, 0.5) + RandomFloat(-0.5, 0.5)) * flSpread
+        float const sx = ((next_u() - 0.5f) + (next_u() - 0.5f)) * spread;
+        float const sy = ((next_u() - 0.5f) + (next_u() - 0.5f)) * spread;
+#endif
         if (sx * sx + sy * sy <= max_tan2)
             hits++;
     }
@@ -771,6 +917,9 @@ static bool FindSilentTarget(const Vector& eye, const QAngle& camera, QAngle& ou
                         break;
                     }
                 } else if (allow_wall_trace && (wall_hc_rank < 0 || wall_rank < 0)) {
+#ifndef _WIN64
+                    if (pi > 0) continue;
+#endif
                     float const req = (aim.min_damage > 0.0f)
                         ? (aim.min_damage > (float)hp ? (float)hp : aim.min_damage)
                         : 1.0f;
@@ -911,8 +1060,13 @@ static void RunCombat(CUserCmd* cmd) {
             cmd->sidemove = 0.0f;
         }
         if ( aim.auto_scope && CurrentWeaponGroup( ) == 1 && ( cmd->buttons & IN_ATTACK ) ) {
-            int const zoom = *reinterpret_cast<int*>( (char*)local + 0x1a08 );
+            #ifdef _WIN64
+            int const zoom = *reinterpret_cast<int*>( (char*)local + off::m_bIsScoped );
             if ( zoom == 0 )
+#else
+            int const fov = *reinterpret_cast<int*>( (char*)local + off::m_iFOV );
+            if ( fov == 0 || fov == 90 )
+#endif
                 cmd->buttons |= IN_ATTACK2;
         }
     }
@@ -929,8 +1083,8 @@ static void RunCombat(CUserCmd* cmd) {
         if (widx > 0) {
             void* nw = entity_list.GetClientNetworkable(widx);
             if (nw) {
-                void* cc = VFunc<void*(__fastcall*)(void*)>(nw, 2)(nw);
-                const char* cls = cc ? *reinterpret_cast<const char**>((char*)cc + 0x10) : nullptr;
+                void* cc = VFunc<void*(THISCALL_CC*)(void*)>(nw, 2)(nw);
+                const char* cls = ClientClassName(cc);
                 if (cls && (strstr(cls, "Knife") || strstr(cls, "knife")))
                     knife = true;
             }
@@ -983,7 +1137,7 @@ static void RunCombat(CUserCmd* cmd) {
 
     bool const trig_on = cfg.triggerbot ||
         BindActive(cfg.kb_triggerbot, cfg.kb_mode_triggerbot, BIND_TRIGGERBOT);
-    if (!knife && trig_on && !cfg.menu_open &&
+    if (!knife && trig_on && !cfg.menu_open && WeaponCanFire(local) &&
         *reinterpret_cast<char*>((char*)local + off::m_lifeState) == 0 &&
         *reinterpret_cast<int*>((char*)local + off::m_iHealth) > 0) {
         bool fire = false;
@@ -1058,7 +1212,9 @@ static void RunCombat(CUserCmd* cmd) {
                     QAngle a = CalcAngle(eye, points[k]);
                     if (AngleDistance(a, cmd->viewangles) > fov) continue;
                     bool const visible = TraceVisible(eye, points[k], ent);
-                    if (!visible && !screen_over) continue;
+                    bool const can_wall = !visible && cfg.auto_wall && (k == 0 || k == 2) &&
+                        CanPenetrateTarget(eye, points[k], ent, point_hb[k], aim.min_damage);
+                    if (!visible && !can_wall) continue;
                     // 0 means "no hit chance requirement" (the slider's leftmost position)
                     if (!cfg.nospread && aim.hit_chance > 0.0f) {
                         Vector const dv = points[k] - eye;
@@ -1142,34 +1298,46 @@ static void RunAntiAim(CUserCmd* cmd, const QAngle& base) {
     else if (cfg.aa_pitch == 3)  out.x = 0.0f;    // zero
     else                         out.x = base.x;  // none = your view pitch
 
-    // Yaw base: local view or nearest target direction
+    // Yaw base: local view or nearest target direction (cached 100 ms to avoid
+    // scanning 64 entities every tick)
     float yaw = base.y;
     if (cfg.aa_base == 1) {
-        void* local = GetLocalEntity();
-        if (local) {
-            Vector eye = PlayerEye(local);
-            float best = 1.0e18f;
-            float best_yaw = yaw;
-            for (int i = 1; i <= 64; i++) {
-                void* ent = entity_list.GetClientEntity(i);
-                if (!ent || ent == local) continue;
-                if (!IsPlayerIndex(i)) continue;
-                if (EntityIsStale(ent, i)) continue;
-                if (*reinterpret_cast<char*>((char*)ent + off::m_lifeState) != 0) continue;
-                if (*reinterpret_cast<int*>((char*)ent + off::m_iHealth) <= 0) continue;
-                if (*reinterpret_cast<int*>((char*)ent + off::m_iTeamNum) ==
-                    *reinterpret_cast<int*>((char*)local + off::m_iTeamNum)) continue;
+        static DWORD last_aa_scan = 0;
+        static float cached_target_yaw = 0.0f;
+        static bool has_cached_target = false;
+        DWORD const now_aa = GetTickCount();
+        if (now_aa - last_aa_scan >= 100) {
+            last_aa_scan = now_aa;
+            has_cached_target = false;
+            void* local = GetLocalEntity();
+            if (local) {
+                Vector eye = PlayerEye(local);
+                float best = 1.0e18f;
+                float best_yaw = yaw;
+                int const local_team = *reinterpret_cast<int*>((char*)local + off::m_iTeamNum);
+                for (int i = 1; i <= 64; i++) {
+                    void* ent = entity_list.GetClientEntity(i);
+                    if (!ent || ent == local) continue;
+                    if (!IsPlayerIndex(i)) continue;
+                    if (EntityIsStale(ent, i)) continue;
+                    if (*reinterpret_cast<char*>((char*)ent + off::m_lifeState) != 0) continue;
+                    if (*reinterpret_cast<int*>((char*)ent + off::m_iHealth) <= 0) continue;
+                    if (*reinterpret_cast<int*>((char*)ent + off::m_iTeamNum) == local_team) continue;
 
-                Vector t = PlayerEye(ent);
-                Vector d = t - eye;
-                float dist = d.x * d.x + d.y * d.y + d.z * d.z;
-                if (dist < best) {
-                    best = dist;
-                    best_yaw = atan2f(d.y, d.x) * 57.29577951308232f;
+                    Vector t = PlayerEye(ent);
+                    Vector d = t - eye;
+                    float dist = d.x * d.x + d.y * d.y + d.z * d.z;
+                    if (dist < best) {
+                        best = dist;
+                        best_yaw = atan2f(d.y, d.x) * 57.29577951308232f;
+                        has_cached_target = true;
+                    }
                 }
+                if (has_cached_target) cached_target_yaw = best_yaw;
             }
-            yaw = best_yaw;
         }
+        if (has_cached_target)
+            yaw = cached_target_yaw;
     }
 
     // Yaw sides with delay (reference: left/right hold for iSideDelay ticks)
@@ -1407,13 +1575,38 @@ static void RunAutoStrafe(CUserCmd* cmd, void* local, const QAngle& camera) {
 
 }
 
-typedef bool(__fastcall* ClientModeCreateMoveFn)(void*, float, CUserCmd*);
+TYPEDEF_THISCALL(bool, ClientModeCreateMoveFn, void*, float, CUserCmd*);
 static ClientModeCreateMoveFn oClientModeCreateMove = nullptr;
 
-static bool __fastcall HookedClientModeCreateMove(void* self, float frametime, CUserCmd* cmd) {
+static QAngle g_menu_lock_angles;
+static bool g_menu_was_open_cm = false;
+
+static HOOK_THISCALL(bool, HookedClientModeCreateMove, void*, float frametime, CUserCmd* cmd) {
     UpdateThirdPerson();
     bool ret = oClientModeCreateMove ? oClientModeCreateMove(self, frametime, cmd) : true;
     if (cmd && cmd->command_number != 0) {
+        // When the menu is open, freeze camera angles and block all background movement/shooting
+        if (cfg.menu_open) {
+            if (!g_menu_was_open_cm) {
+                g_menu_lock_angles = real_view_angles;
+                if (g_menu_lock_angles.x == 0.0f && g_menu_lock_angles.y == 0.0f)
+                    g_menu_lock_angles = cmd->viewangles;
+                g_menu_was_open_cm = true;
+            }
+            cmd->viewangles = g_menu_lock_angles;
+            cmd->forwardmove = 0.0f;
+            cmd->sidemove = 0.0f;
+            cmd->upmove = 0.0f;
+            cmd->mousedx = 0;
+            cmd->mousedy = 0;
+            cmd->buttons &= ~(IN_ATTACK | IN_ATTACK2 | IN_FORWARD | IN_BACK | IN_MOVELEFT | IN_MOVERIGHT | IN_JUMP | IN_DUCK);
+            user_camera_angles = g_menu_lock_angles;
+            real_view_angles = g_menu_lock_angles;
+            if (engine.self) engine.SetViewAngles(g_menu_lock_angles);
+            return false;
+        }
+        g_menu_was_open_cm = false;
+
         // User view for this tick, before aimbot / silent aim / anti-aim.
         user_camera_angles = cmd->viewangles;
 
@@ -1432,13 +1625,12 @@ static bool __fastcall HookedClientModeCreateMove(void* self, float frametime, C
 CUserCmd* GetUserCmd(int sequence) {
     void* input = GetInput();
     if (!input) return nullptr;
-    return VFunc<CUserCmd*(__fastcall*)(void*, int)>(input, INPUT_GET_USERCMD)(input, sequence);
+    return VFunc<CUserCmd*(THISCALL_CC*)(void*, int)>(input, INPUT_GET_USERCMD)(input, sequence);
 }
 
-// CInput keeps a second copy of the command at +0x110 (stride 0x50) which is
-// what the engine actually sends in this x64 build.  GetUserCmd returns the
-// +0x108 array, so the late hook must mirror its changes into this copy.
+// CInput keeps a second copy of the command at +0x110 (stride 0x50) in x64.
 CUserCmd* GetUserCmdCopy(int sequence) {
+#ifdef _WIN64
     void* input = GetInput();
     if (!input) return nullptr;
     void* base = *reinterpret_cast<void**>((char*)input + 0x110);
@@ -1447,15 +1639,19 @@ CUserCmd* GetUserCmdCopy(int sequence) {
     CUserCmd* c = reinterpret_cast<CUserCmd*>((char*)base + static_cast<size_t>(idx) * 0x50);
     if (c->command_number != sequence) return nullptr;
     return c;
+#else
+    (void)sequence;
+    return nullptr;
+#endif
 }
 
-typedef void(__fastcall* BaseCreateMoveFn)(void*, int, float, bool);
+TYPEDEF_THISCALL(void, BaseCreateMoveFn, void*, int, float, bool);
 static BaseCreateMoveFn oBaseCreateMove = nullptr;
 
-typedef void(__fastcall* FrameStageNotifyFn)(void*, int);
+TYPEDEF_THISCALL(void, FrameStageNotifyFn, void*, int);
 static FrameStageNotifyFn oFrameStageNotify = nullptr;
 
-static void __fastcall HookedFrameStageNotify(void* self, int stage) {
+static HOOK_THISCALL(void, HookedFrameStageNotify, void*, int stage) {
     ForceSvCheats();
     // Anti-aim / third-person run at stage 6 exactly like islamware-css-b
     // (its FRAME_RENDER_START constant was 6); custom model work uses 5/6.
@@ -1464,7 +1660,7 @@ static void __fastcall HookedFrameStageNotify(void* self, int stage) {
         void* local = GetLocalEntity();
         if (local && *reinterpret_cast<const char*>((const char*)local + off::m_lifeState) == 0) {
             *reinterpret_cast<QAngle*>((char*)local + OFF_PLAYER_VIEW_ANGLES) = aa_view_angles;
-            *reinterpret_cast<QAngle*>((char*)local + 0x1AA8) = aa_view_angles;
+            *reinterpret_cast<QAngle*>((char*)local + off::m_angEyeAngles) = aa_view_angles;
         }
     }
     if (stage == AA_STAGE && LocalCanThirdPerson()) {
@@ -1477,27 +1673,34 @@ static void __fastcall HookedFrameStageNotify(void* self, int stage) {
 
     static bool g_obs_mode_patched = false;
     if (stage == FRAME_RENDER_START) {
+        if (LocalCanThirdPerson()) {
+            void* local = GetLocalEntity();
+            if (local)
+                *reinterpret_cast<int*>((char*)local + off::m_fEffects) &= ~EF_NODRAW;
+        }
         ClientModel_OnFrameStage(stage);
         if (cfg.thirdperson) {
             void* obs = GetSpectatedPlayer();
             if (obs) {
                 *reinterpret_cast<int*>((char*)obs + off::m_fEffects) &= ~EF_NODRAW;
                 void* local = GetLocalEntity();
-                if (local && *reinterpret_cast<int*>((char*)local + 0x15dc) == 4 /* OBS_MODE_IN_EYE */) {
-                    *reinterpret_cast<int*>((char*)local + 0x15dc) = 5; // OBS_MODE_CHASE so obs model draws
+                if (local && *reinterpret_cast<int*>((char*)local + off::m_iObserverMode) == 4 /* OBS_MODE_IN_EYE */) {
+                    *reinterpret_cast<int*>((char*)local + off::m_iObserverMode) = 5; // OBS_MODE_CHASE so obs model draws
                     g_obs_mode_patched = true;
                 }
             }
         }
     }
     if (oFrameStageNotify) oFrameStageNotify(self, stage);
+    if (stage == FRAME_RENDER_START)
+        Bones_OnFrameStage();
     if (stage == 4 /* FRAME_NET_UPDATE_POSTDATAUPDATE_END */ || stage == FRAME_RENDER_END)
         ClientModel_OnFrameStage(stage);
     if (stage == FRAME_RENDER_END && g_obs_mode_patched) {
         g_obs_mode_patched = false;
         void* local = GetLocalEntity();
-        if (local && *reinterpret_cast<int*>((char*)local + 0x15dc) == 5)
-            *reinterpret_cast<int*>((char*)local + 0x15dc) = 4;
+        if (local && *reinterpret_cast<int*>((char*)local + off::m_iObserverMode) == 5)
+            *reinterpret_cast<int*>((char*)local + off::m_iObserverMode) = 4;
     }
 }
 
@@ -1600,6 +1803,8 @@ static void RunNoSpread(CUserCmd* cmd, bool do_spread, bool do_recoil) {
             }
 
             int const seed = (cmd->random_seed & 255) + 1;
+            float sx = 0.0f, sy = 0.0f;
+#ifdef _WIN64
             float const two_pi = 6.283185307179586f;
             float a, b, c, d;
             if (vRandomSeed && vRandomFloat) {
@@ -1617,8 +1822,23 @@ static void RunNoSpread(CUserCmd* cmd, bool do_spread, bool do_recoil) {
             }
 
             // x64 FX_FireBullets polar spread sum
-            float const sx = cosf(a) * b + cosf(c) * d;
-            float const sy = sinf(a) * b + sinf(c) * d;
+            sx = cosf(a) * b + cosf(c) * d;
+            sy = sinf(a) * b + sinf(c) * d;
+#else
+            // v34 FX_FireBullets triangular spread: RandomFloat(-0.5, 0.5) + RandomFloat(-0.5, 0.5)
+            float x, y;
+            if (vRandomSeed && vRandomFloat) {
+                vRandomSeed(seed);
+                x = vRandomFloat(-0.5f, 0.5f) + vRandomFloat(-0.5f, 0.5f);
+                y = vRandomFloat(-0.5f, 0.5f) + vRandomFloat(-0.5f, 0.5f);
+            } else {
+                SrcRandomSeed(seed);
+                x = SrcRandomFloat(-0.5f, 0.5f) + SrcRandomFloat(-0.5f, 0.5f);
+                y = SrcRandomFloat(-0.5f, 0.5f) + SrcRandomFloat(-0.5f, 0.5f);
+            }
+            sx = x * flSpread;
+            sy = y * flSpread;
+#endif
 
             Vector desired_fwd;
             AngleVectors(cmd->viewangles, desired_fwd);
@@ -1660,8 +1880,8 @@ static bool ActiveWeaponIsAutomatic(const char** out_cls = nullptr) {
     if (idx <= 0) return false;
     void* nw = entity_list.GetClientNetworkable(idx);
     if (!nw) return false;
-    void* cc = VFunc<void*(__fastcall*)(void*)>(nw, 2)(nw);
-    const char* cls = cc ? *reinterpret_cast<const char**>((char*)cc + 16) : nullptr;
+    void* cc = VFunc<void*(THISCALL_CC*)(void*)>(nw, 2)(nw);
+    const char* cls = ClientClassName(cc);
     if (out_cls) *out_cls = cls;
     if (!cls) return false;
     static const char* const autos[] = {
@@ -1756,8 +1976,12 @@ namespace {
                           float sv_friction, float sv_stopspeed, float sv_accel) {
         Vector const vel = *reinterpret_cast<Vector*>((char*)local + off::m_vecVelocity);
         float const speed = sqrtf(vel.x * vel.x + vel.y * vel.y);
+#ifdef _WIN64
         float const surf_fric = *reinterpret_cast<float*>((char*)local + 0x0304);
-        float const maxspeed = *reinterpret_cast<float*>((char*)local + 0x1618);
+#else
+        float const surf_fric = 1.0f;
+#endif
+        float const maxspeed = *reinterpret_cast<float*>((char*)local + off::m_flMaxspeed);
         float const fric = sv_friction * (surf_fric > 0.0f ? surf_fric : 1.0f);
         float const stop_ref = (speed > sv_stopspeed) ? speed : sv_stopspeed;
         if (speed - fric * stop_ref * interval <= 0.1f) {
@@ -1799,7 +2023,7 @@ namespace {
                 if (elapsed > 2.0f) elapsed = 2.0f;
                 void* wpn = GetActiveWeapon(local);
                 float const next_pri = wpn ? *reinterpret_cast<float*>((char*)wpn + off::w_flNextPrimaryAttack) : 0.0f;
-                float const next_atk = *reinterpret_cast<float*>((char*)local + 0x1058);
+                float const next_atk = *reinterpret_cast<float*>((char*)local + off::m_flNextAttack);
                 float ready = ((next_pri > next_atk) ? next_pri : next_atk) - now;
                 if (ready < 0.0f) ready = 0.0f;
                 if (ready > 2.0f) ready = 2.0f;
@@ -1829,8 +2053,12 @@ namespace {
                          moved.z / (mlen + 1.1920929e-7f));
         float const home_dist = sqrtf((origin.x - g_peek.start.x) * (origin.x - g_peek.start.x) +
                                       (origin.y - g_peek.start.y) * (origin.y - g_peek.start.y));
+#ifdef _WIN64
         float const surf_fric = *reinterpret_cast<float*>((char*)local + 0x0304);
-        float const maxspeed = *reinterpret_cast<float*>((char*)local + 0x1618);
+#else
+        float const surf_fric = 1.0f;
+#endif
+        float const maxspeed = *reinterpret_cast<float*>((char*)local + off::m_flMaxspeed);
         float const sf = (surf_fric > 0.0f) ? surf_fric : 1.0f;
         float const fric = sv_friction * sf;
         float const accel = sv_accel * (maxspeed > 1.0f ? maxspeed : 250.0f) * interval * sf;
@@ -1973,15 +2201,35 @@ static void RunPeekAssist(CUserCmd* cmd, void* local, const QAngle& camera,
     PeekUnlock();
 }
 
-static void __fastcall HookedBaseCreateMove(void* self, int sequence_number, float frametime, bool active) {
+static HOOK_THISCALL(void, HookedBaseCreateMove, void*, int sequence_number, float frametime, bool active) {
     g_wd_cmd_tick = (LONG)GetTickCount();
     // previous command was just predicted - if its bullet consumed a round,
     // drop the client-side impact marker for it
     Impacts_TrackShot();
+    bool const shot_fired_clip = Impacts_ConsumeFired();
     if (oBaseCreateMove) oBaseCreateMove(self, sequence_number, frametime, active);
 
     CUserCmd* cmd = GetUserCmd(sequence_number);
     if (!cmd || cmd->command_number == 0) return;
+
+    if (cfg.menu_open) {
+        cmd->viewangles = g_menu_lock_angles;
+        cmd->forwardmove = 0.0f;
+        cmd->sidemove = 0.0f;
+        cmd->upmove = 0.0f;
+        cmd->mousedx = 0;
+        cmd->mousedy = 0;
+        cmd->buttons &= ~(IN_ATTACK | IN_ATTACK2 | IN_FORWARD | IN_BACK | IN_MOVELEFT | IN_MOVERIGHT | IN_JUMP | IN_DUCK);
+        if (engine.self) engine.SetViewAngles(g_menu_lock_angles);
+        CUserCmd* copy = GetUserCmdCopy(sequence_number);
+        if (copy) {
+            copy->viewangles = cmd->viewangles;
+            copy->forwardmove = 0.0f;
+            copy->sidemove = 0.0f;
+            copy->buttons = cmd->buttons;
+        }
+        return;
+    }
 
     // CInput::CreateMove rewrites forwardmove/sidemove after ClientMode, so the
     // air strafer has to modify the command here.  The camera snapshot and the
@@ -2013,22 +2261,6 @@ static void __fastcall HookedBaseCreateMove(void* self, int sequence_number, flo
         if (cmd->buttons & IN_ATTACK) {
             if ((dt_auto_tick++ & 7) == 0)
                 dt_auto = ActiveWeaponIsAutomatic();
-            static DWORD dt_log_tick = 0;
-            DWORD const now = GetTickCount();
-            if (now - dt_log_tick > 2000) {
-                dt_log_tick = now;
-                const char* cls = nullptr;
-                bool const a = ActiveWeaponIsAutomatic(&cls);
-                int clip = -1;
-                void* dl = GetLocalEntity();
-                if (dl) {
-                    int const wh = *reinterpret_cast<int*>((char*)dl + off::m_hActiveWeapon);
-                    void* wep = entity_list.GetClientEntity(wh & 0xFFF);
-                    if (wep) clip = *reinterpret_cast<int*>((char*)wep + off::w_iClip1);
-                }
-                Log("[dt] attack held class=%s auto=%d toggle=%d clip=%d", cls ? cls : "?",
-                    a ? 1 : 0, !a ? 1 : 0, clip);
-            }
             if (!dt_auto) {
                 if (dt_clear)
                     cmd->buttons &= ~IN_ATTACK;
@@ -2060,7 +2292,7 @@ static void __fastcall HookedBaseCreateMove(void* self, int sequence_number, flo
 
     RunExtraMovement(cmd, local, user_camera_angles);
     RunPeekAssist(cmd, local, user_camera_angles, raw_buttons, raw_forward, raw_side,
-                  attacking_now || silent_applied);
+                  attacking_now || silent_applied || shot_fired_clip);
     FixMovement(cmd, user_camera_angles);
 
     // seed-based spread & recoil compensation (after silent aim sets the shot angle)
@@ -2081,7 +2313,7 @@ static void __fastcall HookedBaseCreateMove(void* self, int sequence_number, flo
     SetStage("baseclient::CreateMove end");
 }
 
-void __fastcall HookedOverrideView(void* self, CViewSetup* setup) {
+HOOK_THISCALL(void, HookedOverrideView, void*, CViewSetup* setup) {
     if (oOverrideView) oOverrideView(self, setup);
     if (!setup) return;
 
@@ -2093,7 +2325,7 @@ void __fastcall HookedOverrideView(void* self, CViewSetup* setup) {
     void* local_ov = GetLocalEntity();
     bool const local_alive_ov = local_ov &&
         *reinterpret_cast<const char*>((const char*)local_ov + off::m_lifeState) == 0 &&
-        *reinterpret_cast<const int*>((const char*)local_ov + 0x15dc) == 0;
+        *reinterpret_cast<const int*>((const char*)local_ov + off::m_iObserverMode) == 0;
 
     if ((cfg.aa_enabled || cfg.silentaim) && local_alive_ov) {
         // engine.dll keeps the view angles in a global (rva 0x53E4E4) that
@@ -2112,25 +2344,8 @@ void __fastcall HookedOverrideView(void* self, CViewSetup* setup) {
             void* local = GetLocalEntity();
             if (local) {
                 *reinterpret_cast<QAngle*>((char*)local + OFF_PLAYER_VIEW_ANGLES) = aa_view_angles;
-                *reinterpret_cast<QAngle*>((char*)local + 0x1AA8) = aa_view_angles; // m_angEyeAngles
+                *reinterpret_cast<QAngle*>((char*)local + off::m_angEyeAngles) = aa_view_angles; // m_angEyeAngles
             }
-        }
-    } else if (cfg.fake_model && IsGameReady()) {
-        // fake model without third person: un-hide the local body so it renders
-        void* local = GetLocalEntity();
-        if (local) {
-            int* effects = reinterpret_cast<int*>((char*)local + off::m_fEffects);
-            *effects &= ~EF_NODRAW;
-        }
-    }
-
-    // fake model must also un-hide with AA / silent aim active (the branch
-    // above only runs when both are off)
-    if (cfg.fake_model && !cfg.thirdperson && IsGameReady()) {
-        void* local = GetLocalEntity();
-        if (local) {
-            int* effects = reinterpret_cast<int*>((char*)local + off::m_fEffects);
-            *effects &= ~EF_NODRAW;
         }
     }
 
@@ -2189,17 +2404,24 @@ void __fastcall HookedOverrideView(void* self, CViewSetup* setup) {
     view_origin = setup->origin;
     view_angles = setup->angles;
     if (setup->fov > 1.0f && setup->fov < 179.0f) view_fov = setup->fov;
+#ifdef _WIN64
     if (setup->aspect > 0.1f && setup->aspect < 10.0f) view_aspect = setup->aspect;
+#else
+    if (engine.self) {
+        int sw = 0, sh = 0;
+        engine.GetScreenSize(sw, sh);
+        if (sw > 0 && sh > 0) view_aspect = (float)sw / (float)sh;
+    }
+#endif
     view_valid = true;
 }
 
-bool __fastcall HookedShouldDrawLocalPlayer(void* self, void* player) {
+HOOK_THISCALL(bool, HookedShouldDrawLocalPlayer, void*, void* player) {
     if (LocalCanThirdPerson()) return true;
-    if (cfg.fake_model) return true; // show what others see
     return oShouldDrawLocalPlayer ? oShouldDrawLocalPlayer(self, player) : false;
 }
 
-bool __fastcall HookedShouldDrawViewModel(void* self) {
+HOOK_THISCALL(bool, HookedShouldDrawViewModel, void*) {
     if (LocalCanThirdPerson() || (cfg.thirdperson && GetSpectatedPlayer() != nullptr))
         return false; // no floating hands in third person (alive or spectating)
     return oShouldDrawViewModel ? oShouldDrawViewModel(self) : true;
@@ -2209,10 +2431,20 @@ bool __fastcall HookedShouldDrawViewModel(void* self) {
 // chams
 // ---------------------------------------------------------------------------
 // IVModelRender vtable index 19 is DrawModelExecute(this, state, info, bones)
-// in this x64 build.  It is the function the engine actually calls for world
-// models; the 2-arg public DrawModelEx is not on this path.
+// on x64, and DrawModelEx(this, info) on v34.
+#ifdef _WIN64
 typedef int(__fastcall* DrawModelExecuteFn)(void*, void*, ModelRenderInfo_t*, void*);
 static DrawModelExecuteFn oDrawModelExecute = nullptr;
+static inline int CallOrigDrawModel(void* self, void* state, ModelRenderInfo_t* info, void* bones) {
+    return oDrawModelExecute ? oDrawModelExecute(self, state, info, bones) : 0;
+}
+#else
+typedef int(__thiscall* DrawModelExecuteFn)(void*, ModelRenderInfo_t*);
+static DrawModelExecuteFn oDrawModelExecute = nullptr;
+static inline int CallOrigDrawModel(void* self, void*, ModelRenderInfo_t* info, void*) {
+    return oDrawModelExecute ? oDrawModelExecute(self, info) : 0;
+}
+#endif
 
 constexpr int CHAMS_TYPE_COUNT = 7;
 static void* g_chams_materials[2][CHAMS_TYPE_COUNT] = {};
@@ -2330,21 +2562,61 @@ static void WriteChamsVmts() {
 
     for (int type = 0; type < CHAMS_TYPE_COUNT; type++) {
         const char* body = kChamsBodies[type];
-        size_t len = strlen(body);
+        std::string body_str(body);
+#ifndef _WIN64
+        // Source 2006 (v34) uses vgui/white_additive (lights/white & cube_white don't exist)
+        // and env_cubemap instead of $phong / $envmapfresnel.
+        if (type == 3) {
+            body_str =
+                "\"VertexLitGeneric\"\n{\n"
+                "    \"$basetexture\" \"vgui/white_additive\"\n"
+                "    \"$model\" 1\n"
+                "    \"$nofog\" 1\n"
+                "    \"$envmap\" \"env_cubemap\"\n"
+                "    \"$envmaptint\" \"[0.85 0.85 0.85]\"\n"
+                "    \"$envmapcontrast\" 1\n"
+                "    \"$nocull\" 1\n}\n";
+        } else if (type == 4) {
+            body_str =
+                "\"UnlitGeneric\"\n{\n"
+                "    \"$basetexture\" \"vgui/white_additive\"\n"
+                "    \"$model\" 1\n"
+                "    \"$nofog\" 1\n"
+                "    \"$additive\" 1\n"
+                "    \"$nocull\" 1\n}\n";
+        } else if (type == 5) {
+            body_str =
+                "\"VertexLitGeneric\"\n{\n"
+                "    \"$basetexture\" \"vgui/white_additive\"\n"
+                "    \"$model\" 1\n"
+                "    \"$nofog\" 1\n"
+                "    \"$translucent\" 1\n"
+                "    \"$alpha\" 0.45\n"
+                "    \"$envmap\" \"env_cubemap\"\n"
+                "    \"$envmaptint\" \"[0.7 0.85 1.0]\"\n"
+                "    \"$nocull\" 1\n}\n";
+        } else {
+            for (size_t pos = 0; (pos = body_str.find("lights/white", pos)) != std::string::npos; ) {
+                body_str.replace(pos, 12, "vgui/white_additive");
+                pos += 19;
+            }
+        }
+#endif
+        size_t len = body_str.size();
 
         char path[MAX_PATH];
         snprintf(path, sizeof(path), "%s\\chams%d.vmt", dir, type);
         FILE* f = fopen(path, "wb");
-        if (f) { fwrite(body, 1, len, f); fclose(f); }
+        if (f) { fwrite(body_str.data(), 1, len, f); fclose(f); }
 
         // Same material with $ignorez 1 compiled in, for through-wall chams.
         snprintf(path, sizeof(path), "%s\\chams%dz.vmt", dir, type);
         f = fopen(path, "wb");
         if (f) {
             size_t head = len;
-            while (head > 0 && (body[head - 1] == '\n' || body[head - 1] == ' ')) head--;
-            if (head > 0 && body[head - 1] == '}') head--;
-            fwrite(body, 1, head, f);
+            while (head > 0 && (body_str[head - 1] == '\n' || body_str[head - 1] == ' ')) head--;
+            if (head > 0 && body_str[head - 1] == '}') head--;
+            fwrite(body_str.data(), 1, head, f);
             const char* tail = "    \"$ignorez\" 1\n}\n";
             fwrite(tail, 1, strlen(tail), f);
             fclose(f);
@@ -2414,15 +2686,21 @@ static void* GetChamsMaterial(int type, bool ignorez, const float* glow_color = 
         return glow_material;
     }
 
+    static bool s_chams_failed[2][CHAMS_TYPE_COUNT] = {};
     if (g_chams_materials[i][type]) return g_chams_materials[i][type];
+    if (s_chams_failed[i][type]) return nullptr;
 
-    WriteChamsVmts();
+    static bool s_vmts_written = false;
+    if (!s_vmts_written) {
+        s_vmts_written = true;
+        WriteChamsVmts();
+    }
 
     char name[64];
     snprintf(name, sizeof(name), ignorez ? "islamware/chams%dz" : "islamware/chams%d", type);
     void* material = material_system.FindMaterial(name, "Model textures", false);
 
-    if (!material && type == 0) {
+    if (!material) {
         static const char* fallbacks[] = { "vgui/white_additive", "effects/flashbang_white" };
         for (const char* candidate : fallbacks) {
             material = material_system.FindMaterial(candidate, "Model textures", false);
@@ -2436,13 +2714,16 @@ static void* GetChamsMaterial(int type, bool ignorez, const float* glow_color = 
         Log("chams: type %d ignorez=%d material %p name=%s", type, ignorez ? 1 : 0,
             material, m.GetName() ? m.GetName() : "?");
     } else {
+        s_chams_failed[i][type] = true;
         Log("chams: type %d ignorez=%d material not found", type, ignorez ? 1 : 0);
     }
     g_chams_materials[i][type] = material;
     return material;
 }
 
-static void ApplyChamsMaterial( void* material, const float color[4], bool ignorez, bool glow = false ) {
+constexpr int MATERIAL_VAR_WIREFRAME_FLAG = (1 << 28);
+
+static void ApplyChamsMaterial( void* material, const float color[4], bool ignorez, bool glow = false, bool wireframe = false ) {
     IMaterial mat;
     mat.self = material;
     float alpha = color[3];
@@ -2468,6 +2749,7 @@ static void ApplyChamsMaterial( void* material, const float color[4], bool ignor
 
     mat.AlphaModulate( alpha );
     mat.SetMaterialVarFlag( MATERIAL_VAR_IGNOREZ, ignorez );
+    mat.SetMaterialVarFlag( MATERIAL_VAR_WIREFRAME_FLAG, wireframe );
     model_render.ForcedMaterialOverride( material );
 }
 
@@ -2549,7 +2831,8 @@ static void UpdateHitChams( ) {
 
     for ( int i = 1; i <= 64; i++ ) {
         void* ent = entity_list.GetClientEntity( i );
-        int hp = ent ? *reinterpret_cast<int*>( (char*)ent + off::m_iHealth ) : 0;
+        if ( !ent || !IsPlayerIndex( i ) ) continue;
+        int hp = *reinterpret_cast<int*>( (char*)ent + off::m_iHealth );
 
         if ( hp > 0 && g_last_hp[i] > 0 && hp < g_last_hp[i] )
             g_hit_time[i] = now;
@@ -2563,9 +2846,15 @@ static void UpdateHitChams( ) {
 
 static int DrawModelExecuteInner( void* self, void* state, ModelRenderInfo_t* info, void* bones );
 
+#ifdef _WIN64
 int __fastcall HookedDrawModelExecute( void* self, void* state, ModelRenderInfo_t* info, void* bones ) {
+#else
+int __fastcall HookedDrawModelExecute( void* self, void* /*edx*/, ModelRenderInfo_t* info ) {
+    void* state = nullptr;
+    void* bones = nullptr;
+#endif
     if ( !info )
-        return oDrawModelExecute ? oDrawModelExecute( self, state, info, bones ) : 0;
+        return CallOrigDrawModel( self, state, info, bones );
 
     void* bones_use = bones;
     const char* info_model = info->pModel ? model_info.GetModelName(info->pModel) : nullptr;
@@ -2579,7 +2868,7 @@ int __fastcall HookedDrawModelExecute( void* self, void* state, ModelRenderInfo_
          ( cfg.viewmodel_x != 0.0f || cfg.viewmodel_y != 0.0f || cfg.viewmodel_z != 0.0f ) ) {
         void* local = GetLocalEntity( );
         if ( local ) {
-            int const handle = *reinterpret_cast<int*>( (char*)local + 0x16f0 );
+            int const handle = *reinterpret_cast<int*>( (char*)local + off::m_hViewModel );
             int const vm_index = handle & 0xFFF;
             if ( (vm_index > 0 && info->entity_index == vm_index) || is_vm_model(info_model) ) {
                 // copy only the entity's real bone count - blindly copying 128
@@ -2588,11 +2877,13 @@ int __fastcall HookedDrawModelExecute( void* self, void* state, ModelRenderInfo_
                 // GetStudiomodel: the MDL cache (datacache) is main-thread only
                 // and crashed when touched from the render thread.
                 int bone_count = 128;
+#ifdef _WIN64
                 if ( info->pRenderable ) {
                     int const cached = *reinterpret_cast< int const* >( ( char* )info->pRenderable + 0xB50 );
                     if ( cached > 0 && cached <= 128 )
                         bone_count = cached;
                 }
+#endif
 
                 Vector fwd, right, up;
                 AngleVectors( view_angles, fwd, right, up );
@@ -2645,20 +2936,37 @@ static int DrawModelExecuteInner( void* self, void* state, ModelRenderInfo_t* in
         return ent_model_names[slot];
     };
 
+    // Fast early-out when no DME feature is active (avoids GetLocalEntity / GetModelName per model).
+    bool const want_vm_offset = (cfg.viewmodel_x != 0.0f || cfg.viewmodel_y != 0.0f || cfg.viewmodel_z != 0.0f);
+    bool const want_vm_chams_any = cfg.chams_viewmodel.visible.enabled || cfg.chams_viewmodel.occluded.enabled || cfg.chams_viewmodel.overlay.enabled;
+    bool const want_wep_chams_any =
+        cfg.chams_weapons.visible.enabled || cfg.chams_weapons.occluded.enabled || cfg.chams_weapons.overlay.enabled ||
+        (cfg.wchams_enemy && (cfg.chams_enemy.visible.enabled || cfg.chams_enemy.occluded.enabled || cfg.chams_enemy.overlay.enabled)) ||
+        (cfg.wchams_team && (cfg.chams_team.visible.enabled || cfg.chams_team.occluded.enabled || cfg.chams_team.overlay.enabled));
+    bool const want_plr_chams_any =
+        (cfg.backtrack && cfg.backtrack_chams) || cfg.chams_hit ||
+        cfg.chams_enemy.visible.enabled || cfg.chams_enemy.occluded.enabled || cfg.chams_enemy.overlay.enabled ||
+        cfg.chams_team.visible.enabled  || cfg.chams_team.occluded.enabled  || cfg.chams_team.overlay.enabled  ||
+        cfg.chams_local.visible.enabled || cfg.chams_local.occluded.enabled || cfg.chams_local.overlay.enabled;
+    if (!want_vm_offset && !want_vm_chams_any && !want_wep_chams_any && !want_plr_chams_any && !cfg.world_props)
+        return CallOrigDrawModel(self, state, info, bones);
+
     // Viewmodel position offsets.  The local viewmodel entity handle lives on
-    // the player at 0x16f0, so we can identify its draw calls safely.
-    const char* dme_model = info->pModel ? model_info.GetModelName(info->pModel) : nullptr;
+    // the player at off::m_hViewModel, so we can identify its draw calls safely.
+    void* const dme_local = IsGameReady() ? GetLocalEntity() : nullptr;
+    int const dme_vm_index = dme_local
+        ? (*reinterpret_cast<int*>((char*)dme_local + off::m_hViewModel) & 0xFFF)
+        : 0;
+    bool const need_model_name = want_vm_offset || want_vm_chams_any || cfg.world_props ||
+                                 (want_wep_chams_any && info->entity_index > 64);
+    const char* dme_model = (need_model_name && info->pModel) ? model_info.GetModelName(info->pModel) : nullptr;
     auto is_vm_draw = [&](int vm_index) -> bool {
         if (vm_index > 0 && info->entity_index == vm_index) return true;
         return dme_model && (strstr(dme_model, "/v_") || strstr(dme_model, "\\v_"));
     };
 
-    if ( IsGameReady( ) && ( cfg.viewmodel_x != 0.0f || cfg.viewmodel_y != 0.0f || cfg.viewmodel_z != 0.0f ) ) {
-        void* local = GetLocalEntity( );
-        if ( local ) {
-            int const handle = *reinterpret_cast<int*>( (char*)local + 0x16f0 );
-            int const vm_index = handle & 0xFFF;
-            if ( is_vm_draw(vm_index) ) {
+    if ( dme_local && ( cfg.viewmodel_x != 0.0f || cfg.viewmodel_y != 0.0f || cfg.viewmodel_z != 0.0f ) ) {
+        if ( is_vm_draw(dme_vm_index) ) {
                 Vector fwd, right, up;
                 AngleVectors( view_angles, fwd, right, up );
                 Vector const new_origin = info->origin + right * cfg.viewmodel_x + up * cfg.viewmodel_y + fwd * cfg.viewmodel_z;
@@ -2675,7 +2983,6 @@ static int DrawModelExecuteInner( void* self, void* state, ModelRenderInfo_t* in
                     info->pModelToWorld = &vm_matrix;
                 }
                 info->origin = new_origin;
-            }
         }
     }
 
@@ -2683,12 +2990,9 @@ static int DrawModelExecuteInner( void* self, void* state, ModelRenderInfo_t* in
     // Check both entity index (m_hViewModel) and model path ("/v_") because
     // the engine can submit the viewmodel draw carrying the held weapon's
     // entity index instead of the viewmodel entity index.
-    {
-        void* local = GetLocalEntity( );
-        if ( local && IsGameReady( ) ) {
-            int const handle = *reinterpret_cast<int*>( (char*)local + 0x16f0 );
-            int const vm_index = handle & 0xFFF;
-            if ( is_vm_draw( vm_index ) ) {
+    if ( dme_local &&
+         ( cfg.chams_viewmodel.visible.enabled || cfg.chams_viewmodel.occluded.enabled || cfg.chams_viewmodel.overlay.enabled ) ) {
+        if ( is_vm_draw( dme_vm_index ) ) {
                 Config::ChamsTarget const* target = &cfg.chams_viewmodel;
                 Config::ChamsLayer const* base = target->visible.enabled ? &target->visible : &target->occluded;
                 bool const overlay = target->overlay.enabled;
@@ -2704,14 +3008,14 @@ static int DrawModelExecuteInner( void* self, void* state, ModelRenderInfo_t* in
                                 render_view.SetColorModulation( base->color );
                                 render_view.SetBlend( alpha );
                             }
-                            result = oDrawModelExecute ? oDrawModelExecute( self, state, info, bones ) : 0;
+                            result = CallOrigDrawModel(self, state, info, bones);
                             ResetChamsMaterial( );
                             drew = true;
                         } else {
                             void* material = GetChamsMaterial( base->material, ignorez, base->color );
                             if ( material ) {
-                                ApplyChamsMaterial( material, base->color, ignorez, false );
-                                result = oDrawModelExecute ? oDrawModelExecute( self, state, info, bones ) : 0;
+                                ApplyChamsMaterial( material, base->color, ignorez, false, base->material == 6 );
+                                result = CallOrigDrawModel(self, state, info, bones);
                                 ResetChamsMaterial( );
                                 drew = true;
                             }
@@ -2719,21 +3023,21 @@ static int DrawModelExecuteInner( void* self, void* state, ModelRenderInfo_t* in
                     }
 
                     if ( overlay ) {
-                        if ( !drew && oDrawModelExecute )
-                            result = oDrawModelExecute( self, state, info, bones );
+                        if (!drew)
+                            result = CallOrigDrawModel(self, state, info, bones);
                         if ( target->overlay.material >= CHAMS_TYPE_COUNT ) {
                             if ( render_view.self ) {
                                 float alpha = target->overlay.color[3] < 0.02f ? 0.02f : ( target->overlay.color[3] > 1.f ? 1.f : target->overlay.color[3] );
                                 render_view.SetColorModulation( target->overlay.color );
                                 render_view.SetBlend( alpha );
                             }
-                            result = oDrawModelExecute ? oDrawModelExecute( self, state, info, bones ) : 0;
+                            result = CallOrigDrawModel(self, state, info, bones);
                             ResetChamsMaterial( );
                         } else {
                             void* material = GetChamsMaterial( target->overlay.material, false, target->overlay.color );
                             if ( material ) {
-                                ApplyChamsMaterial( material, target->overlay.color, false, target->overlay.material == 4 );
-                                result = oDrawModelExecute ? oDrawModelExecute( self, state, info, bones ) : 0;
+                                ApplyChamsMaterial( material, target->overlay.color, false, target->overlay.material == 4, target->overlay.material == 6 );
+                                result = CallOrigDrawModel(self, state, info, bones);
                                 ResetChamsMaterial( );
                             }
                         }
@@ -2744,9 +3048,6 @@ static int DrawModelExecuteInner( void* self, void* state, ModelRenderInfo_t* in
                 }
             }
         }
-    }
-
-
     // World props tint: one draw with colour modulation (no material override,
     // no re-draw — that combination corrupted the render pipeline before).
     // Props are entities outside the player range; the model name check keeps
@@ -2765,67 +3066,63 @@ static int DrawModelExecuteInner( void* self, void* state, ModelRenderInfo_t* in
             static const float white[3] = { 1.0f, 1.0f, 1.0f };
             render_view.SetColorModulation(cfg.prop_color);
             render_view.SetBlend(a);
-            int const r = oDrawModelExecute ? oDrawModelExecute(self, state, info, bones) : 0;
+            int const r = CallOrigDrawModel(self, state, info, bones);
             render_view.SetColorModulation(white);
             render_view.SetBlend(1.0f);
             return r;
         }
     }
 
-    // Weapon chams: world weapons only.  CS:S viewmodels (v_*.mdl) contain
-    // the arms as part of the same model, so tinting the first-person
-    // viewmodel always recolours the hands - the viewmodel is therefore left
-    // to the separate "Viewmodel" chams target.  Weapon chams touch weapons
-    // drawn in the world: the local player's own weapon in third person
-    // (chams_weapons), dropped weapons (chams_weapons), and held weapons of
-    // enemies/teammates when those toggles are enabled.
-    if (IsGameReady() && info->entity_index > 64) {
-        // Never let weapon chams reach the first-person viewmodel.  Every
-        // CS:S v_*.mdl bakes the arms into the same model, so tinting that
-        // draw recolours the hands.  The viewmodel draw can arrive carrying
-        // the held weapon's entity index, so the model name is the reliable
-        // discriminator; the viewmodel entity handle catches the rest.
-        const char* wmodel = info->pModel ? model_info.GetModelName(info->pModel) : nullptr;
-        if (wmodel && (strstr(wmodel, "/v_") || strstr(wmodel, "\\v_")))
-            return oDrawModelExecute ? oDrawModelExecute(self, state, info, bones) : 0;
-        void* vm_local = GetLocalEntity();
-        if (vm_local) {
-            int const vm_handle = *reinterpret_cast<int*>((char*)vm_local + 0x16f0) & 0xFFF;
-            if (vm_handle > 0 && info->entity_index == vm_handle)
-                return oDrawModelExecute ? oDrawModelExecute(self, state, info, bones) : 0;
-        }
+    // Weapon chams: held world weapons only (no dropped weapons).  CS:S
+    // viewmodels (v_*.mdl) contain the arms as part of the same model, so
+    // first-person viewmodel tinting stays in the separate "Viewmodel" target.
+    bool const want_weapon_chams =
+        cfg.chams_weapons.visible.enabled || cfg.chams_weapons.occluded.enabled || cfg.chams_weapons.overlay.enabled ||
+        (cfg.wchams_enemy && (cfg.chams_enemy.visible.enabled || cfg.chams_enemy.occluded.enabled || cfg.chams_enemy.overlay.enabled)) ||
+        (cfg.wchams_team && (cfg.chams_team.visible.enabled || cfg.chams_team.occluded.enabled || cfg.chams_team.overlay.enabled));
+
+    if (want_weapon_chams && IsGameReady() && info->entity_index > 64) {
+        if (dme_model && (strstr(dme_model, "/v_") || strstr(dme_model, "\\v_")))
+            return CallOrigDrawModel(self, state, info, bones);
+        if (dme_vm_index > 0 && info->entity_index == dme_vm_index)
+            return CallOrigDrawModel(self, state, info, bones);
         Config::ChamsTarget* weapon_target_config = nullptr;
-        void* went = entity_list.GetClientEntity(info->entity_index);
-        if (went) {
-            bool is_weapon_entity = false;
-            void* nw = entity_list.GetClientNetworkable(info->entity_index);
-            if (nw) {
-                void* cc = VFunc<void*(__fastcall*)(void*)>(nw, 2)(nw);
-                const char* cls = cc ? *reinterpret_cast<const char**>((char*)cc + 16) : nullptr;
-                if (cls && !strstr(cls, "PlantedC4") &&
-                    (strstr(cls, "Weapon") || strstr(cls, "Knife") ||
-                     strstr(cls, "Grenade") || strcmp(cls, "CC4") == 0))
-                    is_weapon_entity = true;
-            }
-            if (is_weapon_entity) {
-                int const owner = *reinterpret_cast<int const*>((char*)went + 0x0be0); // m_hOwner
-                int const owner_idx = owner & 0xFFF;
-                int const local_idx = engine.GetLocalPlayer();
-                if (owner_idx == local_idx && local_idx > 0) {
-                    weapon_target_config = &cfg.chams_weapons; // own weapon, 3rd person
-                } else if (owner_idx > 0 && owner_idx <= 64) {
-                    void* owner_ent = entity_list.GetClientEntity(owner_idx);
-                    if (owner_ent) {
-                        int const oteam = *reinterpret_cast<int const*>((char*)owner_ent + off::m_iTeamNum);
-                        void* local_ent = entity_list.GetClientEntity(local_idx);
-                        int const lteam = local_ent ? *reinterpret_cast<int const*>((char*)local_ent + off::m_iTeamNum) : 0;
-                        if (cfg.wchams_enemy && oteam != lteam)
-                            weapon_target_config = &cfg.chams_enemy;
-                        else if (cfg.wchams_team && oteam == lteam)
-                            weapon_target_config = &cfg.chams_team;
+        int const local_aw_idx = dme_local
+            ? (*reinterpret_cast<int const*>((char*)dme_local + off::m_hActiveWeapon) & 0xFFF)
+            : 0;
+        if (local_aw_idx > 0 && info->entity_index == local_aw_idx) {
+            weapon_target_config = &cfg.chams_weapons; // own active weapon in 3rd person
+        } else {
+            void* went = entity_list.GetClientEntity(info->entity_index);
+            if (went) {
+                bool is_weapon_entity = false;
+                void* nw = entity_list.GetClientNetworkable(info->entity_index);
+                if (nw) {
+                    void* cc = VFunc<void*(THISCALL_CC*)(void*)>(nw, 2)(nw);
+                    const char* cls = ClientClassName(cc);
+                    if (cls && !strstr(cls, "PlantedC4") &&
+                        (strstr(cls, "Weapon") || strstr(cls, "Knife") ||
+                         strstr(cls, "Grenade") || strcmp(cls, "CC4") == 0))
+                        is_weapon_entity = true;
+                }
+                if (is_weapon_entity) {
+                    int const owner = *reinterpret_cast<int const*>((char*)went + off::w_hOwner);
+                    int const owner_idx = owner & 0xFFF;
+                    int const local_idx = engine.GetLocalPlayer();
+                    if (owner_idx == local_idx && local_idx > 0) {
+                        weapon_target_config = &cfg.chams_weapons; // own weapon, 3rd person
+                    } else if (owner_idx > 0 && owner_idx <= 64) {
+                        void* owner_ent = entity_list.GetClientEntity(owner_idx);
+                        if (owner_ent) {
+                            int const oteam = *reinterpret_cast<int const*>((char*)owner_ent + off::m_iTeamNum);
+                            void* local_ent = entity_list.GetClientEntity(local_idx);
+                            int const lteam = local_ent ? *reinterpret_cast<int const*>((char*)local_ent + off::m_iTeamNum) : 0;
+                            if (cfg.wchams_enemy && oteam != lteam)
+                                weapon_target_config = &cfg.chams_enemy;
+                            else if (cfg.wchams_team && oteam == lteam)
+                                weapon_target_config = &cfg.chams_team;
+                        }
                     }
-                } else if (owner_idx == 0 || owner_idx > 64) {
-                    weapon_target_config = &cfg.chams_weapons; // dropped
                 }
             }
         }
@@ -2838,19 +3135,19 @@ static int DrawModelExecuteInner( void* self, void* state, ModelRenderInfo_t* in
             if (wbase->enabled && wbase->material < CHAMS_TYPE_COUNT) {
                 void* material = GetChamsMaterial(wbase->material, cfg.chams_disable_occlusion, wbase->color);
                 if (material) {
-                    ApplyChamsMaterial(material, wbase->color, cfg.chams_disable_occlusion, false);
-                    result = oDrawModelExecute ? oDrawModelExecute(self, state, info, bones) : 0;
+                    ApplyChamsMaterial(material, wbase->color, cfg.chams_disable_occlusion, false, wbase->material == 6);
+                    result = CallOrigDrawModel(self, state, info, bones);
                     ResetChamsMaterial();
                     drew = true;
                 }
             }
             if (woverlay && wt->overlay.material < CHAMS_TYPE_COUNT) {
-                if (!drew && oDrawModelExecute)
-                    result = oDrawModelExecute(self, state, info, bones);
+                if (!drew)
+                    result = CallOrigDrawModel(self, state, info, bones);
                 void* material = GetChamsMaterial(wt->overlay.material, false, wt->overlay.color);
                 if (material) {
-                    ApplyChamsMaterial(material, wt->overlay.color, false, false);
-                    result = oDrawModelExecute ? oDrawModelExecute(self, state, info, bones) : 0;
+                    ApplyChamsMaterial(material, wt->overlay.color, false, false, wt->overlay.material == 6);
+                    result = CallOrigDrawModel(self, state, info, bones);
                     ResetChamsMaterial();
                 }
             }
@@ -2859,11 +3156,17 @@ static int DrawModelExecuteInner( void* self, void* state, ModelRenderInfo_t* in
             // a layer was enabled but the material failed to resolve: draw the
             // weapon normally instead of leaving it invisible
             if (wt->visible.enabled || wt->occluded.enabled)
-                return oDrawModelExecute ? oDrawModelExecute(self, state, info, bones) : 0;
+                return CallOrigDrawModel(self, state, info, bones);
         }
     }
 
-    if ( IsGameReady( ) && info->entity_index > 0 && info->entity_index <= 64 ) {
+    bool const want_player_chams =
+        (cfg.backtrack && cfg.backtrack_chams) || cfg.chams_hit ||
+        cfg.chams_enemy.visible.enabled || cfg.chams_enemy.occluded.enabled || cfg.chams_enemy.overlay.enabled ||
+        cfg.chams_team.visible.enabled  || cfg.chams_team.occluded.enabled  || cfg.chams_team.overlay.enabled  ||
+        cfg.chams_local.visible.enabled || cfg.chams_local.occluded.enabled || cfg.chams_local.overlay.enabled;
+
+    if ( want_player_chams && IsGameReady( ) && info->entity_index > 0 && info->entity_index <= 64 && IsPlayerIndex( info->entity_index ) ) {
         void* ent = entity_list.GetClientEntity( info->entity_index );
         int hp = ent ? *reinterpret_cast<int*>( (char*)ent + off::m_iHealth ) : 0;
         int team = ent ? *reinterpret_cast<int*>( (char*)ent + off::m_iTeamNum ) : 0;
@@ -2871,31 +3174,56 @@ static int DrawModelExecuteInner( void* self, void* state, ModelRenderInfo_t* in
             *reinterpret_cast<char*>( (char*)ent + off::m_lifeState ) == 0 &&
             ( team == 2 || team == 3 );
 
-        // backtrack chams: draw the same model again with the bones translated
-        // to the recorded historical position
-        if ( alive && cfg.backtrack && cfg.backtrack_chams && ent && bones && info->pRenderable ) {
+        // backtrack chams: draw the same model again with the bones (x64) or
+        // model transform (v34) translated to the recorded historical position
+        if ( alive && cfg.backtrack && cfg.backtrack_chams && ent && info->pRenderable ) {
             Vector const cur_org = *reinterpret_cast<Vector*>((char*)ent + off::m_vecOrigin);
             Vector const bt = Backtrack_PickRaw( info->entity_index, cfg.backtrack_time );
             if ( !(bt.x == 0.0f && bt.y == 0.0f && bt.z == 0.0f) ) {
                 Vector const delta = bt - cur_org;
-                int bone_count = 128;
-                int const cached = *reinterpret_cast<int const*>((char*)info->pRenderable + 0xB50);
-                if ( cached > 0 && cached <= 128 ) bone_count = cached;
-
-                static matrix3x4_t bt_bones[128];
-                matrix3x4_t const* src = ( matrix3x4_t const* )bones;
-                for ( int i = 0; i < bone_count; i++ ) {
-                    bt_bones[i] = src[i];
-                    bt_bones[i].m[0][3] += delta.x;
-                    bt_bones[i].m[1][3] += delta.y;
-                    bt_bones[i].m[2][3] += delta.z;
-                }
-                void* material = GetChamsMaterial( 1 /*flat*/, false, cfg.bt_chams_color );
+                void* material = GetChamsMaterial( 1 /*flat*/, true /*ignorez*/, cfg.bt_chams_color );
                 if ( material ) {
-                    ApplyChamsMaterial( material, cfg.bt_chams_color, false, false );
-                    if ( oDrawModelExecute )
-                        oDrawModelExecute( self, state, info, bt_bones );
-                    ResetChamsMaterial( );
+#ifdef _WIN64
+                    if ( bones ) {
+                        int bone_count = 128;
+                        int const cached = *reinterpret_cast<int const*>((char*)info->pRenderable + 0xB50);
+                        if ( cached > 0 && cached <= 128 ) bone_count = cached;
+
+                        static matrix3x4_t bt_bones[128];
+                        matrix3x4_t const* src = ( matrix3x4_t const* )bones;
+                        for ( int i = 0; i < bone_count; i++ ) {
+                            bt_bones[i] = src[i];
+                            bt_bones[i].m[0][3] += delta.x;
+                            bt_bones[i].m[1][3] += delta.y;
+                            bt_bones[i].m[2][3] += delta.z;
+                        }
+                        ApplyChamsMaterial( material, cfg.bt_chams_color, true, false, false );
+                        CallOrigDrawModel(self, state, info, bt_bones);
+                        ResetChamsMaterial( );
+                    }
+#else
+                    matrix3x4_t* cached_bones = *reinterpret_cast<matrix3x4_t**>((char*)info->pRenderable + 0x66c);
+                    int const cached_count = *reinterpret_cast<int*>((char*)info->pRenderable + 0x678);
+                    if ( cached_bones && cached_count > 0 && cached_count <= 128 ) {
+                        static float saved_t[128][3];
+                        for ( int i = 0; i < cached_count; i++ ) {
+                            saved_t[i][0] = cached_bones[i].m[0][3];
+                            saved_t[i][1] = cached_bones[i].m[1][3];
+                            saved_t[i][2] = cached_bones[i].m[2][3];
+                            cached_bones[i].m[0][3] += delta.x;
+                            cached_bones[i].m[1][3] += delta.y;
+                            cached_bones[i].m[2][3] += delta.z;
+                        }
+                        ApplyChamsMaterial( material, cfg.bt_chams_color, true, false, false );
+                        CallOrigDrawModel(self, state, info, bones);
+                        ResetChamsMaterial( );
+                        for ( int i = 0; i < cached_count; i++ ) {
+                            cached_bones[i].m[0][3] = saved_t[i][0];
+                            cached_bones[i].m[1][3] = saved_t[i][1];
+                            cached_bones[i].m[2][3] = saved_t[i][2];
+                        }
+                    }
+#endif
                 }
             }
         }
@@ -2911,14 +3239,29 @@ static int DrawModelExecuteInner( void* self, void* state, ModelRenderInfo_t* in
                                               : ( is_teammate ? &cfg.chams_team : &cfg.chams_enemy );
 
             bool visible = true;
-            if ( local_ent ) {
-                Vector eye = PlayerEye( local_ent );
-                visible = TraceVisible( eye, PlayerEye( ent ) );
+            if ( local_ent && target->visible.enabled != target->occluded.enabled ) {
+                static bool s_vis_cache[65] = {};
+                static DWORD s_vis_tick[65] = {};
+                DWORD const now_v = GetTickCount();
+                if (now_v - s_vis_tick[info->entity_index] >= 100) {
+                    s_vis_tick[info->entity_index] = now_v;
+                    Vector eye = PlayerEye( local_ent );
+                    s_vis_cache[info->entity_index] = TraceVisible( eye, PlayerEye( ent ) );
+                }
+                visible = s_vis_cache[info->entity_index];
+            } else if ( local_ent && target->visible.enabled && target->occluded.enabled ) {
+                static bool s_vis_cache2[65] = {};
+                static DWORD s_vis_tick2[65] = {};
+                DWORD const now_v = GetTickCount();
+                if (now_v - s_vis_tick2[info->entity_index] >= 100) {
+                    s_vis_tick2[info->entity_index] = now_v;
+                    Vector eye = PlayerEye( local_ent );
+                    s_vis_cache2[info->entity_index] = TraceVisible( eye, PlayerEye( ent ) );
+                }
+                visible = s_vis_cache2[info->entity_index];
             }
 
-            // The local body is never "visible" from its own eye and in third
-            // person the occluded layer is the one that should show.
-            bool const use_occluded = !visible || is_local;
+            bool const use_occluded = (!visible || is_local);
             Config::ChamsLayer const* base = use_occluded ? &target->occluded : &target->visible;
             if ( !base->enabled ) {
                 Config::ChamsLayer const* other = use_occluded ? &target->visible : &target->occluded;
@@ -2928,7 +3271,7 @@ static int DrawModelExecuteInner( void* self, void* state, ModelRenderInfo_t* in
                              HitChamsActive( info->entity_index );
             bool const overlay_wanted = target->overlay.enabled || hit;
             bool const base_wanted = base->enabled;
-            bool const ignorez = use_occluded || cfg.chams_disable_occlusion;
+            bool const ignorez = (use_occluded || cfg.chams_disable_occlusion);
 
             if ( base_wanted || overlay_wanted ) {
                 int result = 0;
@@ -2942,15 +3285,15 @@ static int DrawModelExecuteInner( void* self, void* state, ModelRenderInfo_t* in
                             float alpha = base->color[3] < 0.02f ? 0.02f : ( base->color[3] > 1.f ? 1.f : base->color[3] );
                             render_view.SetBlend( alpha );
                         }
-                        result = oDrawModelExecute ? oDrawModelExecute( self, state, info, bones ) : 0;
+                        result = CallOrigDrawModel(self, state, info, bones);
                         ResetChamsMaterial( );
                         drew_base = true;
                     } else {
                         void* material = GetChamsMaterial( base->material, ignorez, base->color );
                         if ( material ) {
                             SetStage( "chams draw" );
-                            ApplyChamsMaterial( material, base->color, ignorez, false );
-                            result = oDrawModelExecute ? oDrawModelExecute( self, state, info, bones ) : 0;
+                            ApplyChamsMaterial( material, base->color, ignorez, false, base->material == 6 );
+                            result = CallOrigDrawModel(self, state, info, bones);
                             ResetChamsMaterial( );
                             drew_base = true;
                         }
@@ -2958,8 +3301,8 @@ static int DrawModelExecuteInner( void* self, void* state, ModelRenderInfo_t* in
                 }
 
                 if ( overlay_wanted ) {
-                    if ( !drew_base && oDrawModelExecute )
-                        result = oDrawModelExecute( self, state, info, bones );
+                    if (!drew_base)
+                        result = CallOrigDrawModel(self, state, info, bones);
 
                     int const type = hit ? cfg.chams_hit_material : target->overlay.material;
                     float const* color = hit ? cfg.chams_hit_color : target->overlay.color;
@@ -2969,14 +3312,19 @@ static int DrawModelExecuteInner( void* self, void* state, ModelRenderInfo_t* in
                             float alpha = color[3] < 0.02f ? 0.02f : ( color[3] > 1.f ? 1.f : color[3] );
                             render_view.SetBlend( alpha );
                         }
-                        result = oDrawModelExecute ? oDrawModelExecute( self, state, info, bones ) : 0;
+                        result = CallOrigDrawModel(self, state, info, bones);
                         ResetChamsMaterial( );
                     } else {
                         void* material = GetChamsMaterial( type, false, color );
                         if ( material ) {
                             SetStage( "chams overlay" );
-                            ApplyChamsMaterial( material, color, false, type == 4 );
-                            result = oDrawModelExecute ? oDrawModelExecute( self, state, info, bones ) : 0;
+#ifdef _WIN64
+                            bool const is_glow = (type == 4);
+#else
+                            bool const is_glow = false;
+#endif
+                            ApplyChamsMaterial( material, color, false, is_glow, type == 6 );
+                            result = CallOrigDrawModel(self, state, info, bones);
                             ResetChamsMaterial( );
                         }
                     }
@@ -2987,7 +3335,18 @@ static int DrawModelExecuteInner( void* self, void* state, ModelRenderInfo_t* in
         }
     }
 
-    return oDrawModelExecute ? oDrawModelExecute( self, state, info, bones ) : 0;
+    if (cfg.world_props && dme_model && (strstr(dme_model, "props") || strstr(dme_model, "Props")) && render_view.self) {
+        float a = cfg.prop_color[3];
+        if (a < 0.05f) a = 0.05f;
+        if (a > 1.0f) a = 1.0f;
+        render_view.SetColorModulation(cfg.prop_color);
+        render_view.SetBlend(a);
+        int const r = CallOrigDrawModel(self, state, info, bones);
+        ResetChamsMaterial();
+        return r;
+    }
+
+    return CallOrigDrawModel(self, state, info, bones);
 }
 
 // ---------------------------------------------------------------------------
@@ -3040,13 +3399,26 @@ static CmdCacheEntry g_cmd_cache[40] = {};
 // the material system and crashed as soon as fullbright was toggled.
 static void CmdSet(const char* name, float value) {
     if (!engine.self) return;
+    auto apply = [&]() {
+#ifndef _WIN64
+        if (cvar.self) {
+            if (ConVar* cv = cvar.FindVar(name)) {
+                int* flags = reinterpret_cast<int*>((char*)cv + 0x14);
+                *flags &= ~(1 << 14); // clear FCVAR_CHEAT
+                VFunc<void(THISCALL_CC*)(void*, float)>(cv, 10)(cv, value);
+            }
+        }
+        return;
+#endif
+        char cmd[128];
+        snprintf(cmd, sizeof(cmd), "%s %g", name, value);
+        engine.ClientCmd(cmd);
+    };
     for (int i = 0; i < 40; i++) {
         if (g_cmd_cache[i].used && strcmp(g_cmd_cache[i].name, name) == 0) {
             if (g_cmd_cache[i].value == value) return;
             g_cmd_cache[i].value = value;
-            char cmd[128];
-            snprintf(cmd, sizeof(cmd), "%s %g", name, value);
-            engine.ClientCmd(cmd);
+            apply();
             return;
         }
     }
@@ -3055,9 +3427,7 @@ static void CmdSet(const char* name, float value) {
             g_cmd_cache[i].used = true;
             g_cmd_cache[i].name = name;
             g_cmd_cache[i].value = value;
-            char cmd[128];
-            snprintf(cmd, sizeof(cmd), "%s %g", name, value);
-            engine.ClientCmd(cmd);
+            apply();
             return;
         }
     }
@@ -3073,26 +3443,39 @@ static void ApplyWorldVisuals() {
     last = now;
 
     g_world_needs_cheats = cfg.world_fullbright || cfg.world_nofog || cfg.world_custom_fog ||
-                           cfg.world_nosky || cfg.rem_postprocess || cfg.rem_shadows ||
+                           cfg.world_nosky || cfg.world_night > 0.001f ||
+                           cfg.world_brightness > 0.001f || cfg.world_model_ambient > 0.001f ||
+                           cfg.rem_postprocess || cfg.rem_shadows ||
                            cfg.rem_decals || cfg.rem_grass || cfg.rem_ropes || cfg.rem_water ||
-                           cfg.rem_dynlights || cfg.rem_shells || cfg.rem_debris || cfg.rem_particles;
+                           cfg.rem_dynlights || cfg.rem_shells || cfg.rem_debris || cfg.rem_blood ||
+                           cfg.rem_particles;
 
     // Make sure sv_cheats is already on before the first cheat-protected
     // command is queued (the normal update runs earlier in the frame).
     ForceSvCheats();
 
+#ifndef _WIN64
+    // On v34, ClientCmd prints FCVAR_CLIENTCMD_CAN_EXECUTE / cheat warnings
+    // for every cvar sent at startup.  Only issue commands when a toggle is on
+    // (or once when turning everything back off to restore defaults).
+    static bool was_world_active = false;
+    bool const world_active = g_world_needs_cheats || cfg.world_bloom != 1.0f || cfg.viewmodel_fov != 0.0f;
+    if (!world_active && !was_world_active)
+        return;
+    was_world_active = world_active;
+#endif
+
     // --- lighting / world ---
-    // mat_monitorgamma changes the monitor gamma ramp for the whole desktop,
-    // not just the game.  Restore the default once and never touch it again;
-    // brightness is handled by r_ambientfraction below.
+    // Keep mat_monitorgamma at default (2.2) so brightness is pinned to the
+    // world rather than changing the screen/monitor gamma ramp.
     static bool gamma_restored = false;
     if (!gamma_restored) {
         gamma_restored = true;
-        if (engine.self) engine.ClientCmd("mat_monitorgamma 2.2");
+        CmdSet("mat_monitorgamma", 2.2f);
     }
 
     CmdSet("mat_fullbright", cfg.world_fullbright ? 1.f : 0.f);
-    CmdSet("mat_bloomscale", cfg.world_bloom);
+    CmdSet("mat_bloomscale", cfg.world_bloom + cfg.world_brightness);
 
     float ambient = cfg.world_model_ambient + cfg.world_brightness * 0.5f - cfg.world_night * 0.5f;
     ambient = ambient < 0.f ? 0.f : (ambient > 1.f ? 1.f : ambient);
@@ -3100,27 +3483,31 @@ static void ApplyWorldVisuals() {
     CmdSet("r_3dsky", (cfg.world_nosky || cfg.world_night > 0.01f) ? 0.f : 1.f);
     // this build has no mat_ambient_light cvars - the real darkness levers
     // are r_ambientboost (brightens dark areas) and r_ambientmin (clamps the
-    // ambient from below); both must follow the night level
-    CmdSet("r_ambientboost", cfg.world_night > 0.05f ? 0.f : 1.f);
-    CmdSet("r_ambientmin", std::max(0.0f, 0.6f - cfg.world_night * 0.6f));
+    // ambient from below); both must follow the night level and model ambient
+    CmdSet("r_ambientboost", (cfg.world_night > 0.05f && cfg.world_model_ambient < 0.05f) ? 0.f : 1.f);
+    CmdSet("r_ambientmin", cfg.world_model_ambient > 0.05f
+                               ? std::min(1.0f, cfg.world_model_ambient * 0.5f)
+                               : std::max(0.0f, 0.6f - cfg.world_night * 0.6f));
+    CmdSet("r_ambientfactor", 5.0f + cfg.world_model_ambient * 10.0f);
 
     // --- fog ---
+    static float last_col[3] = { -1, -1, -1 };
     if (cfg.world_nofog) {
         CmdSet("fog_override", 1.f);
         CmdSet("fog_enable", 0.f);
         CmdSet("fog_enableskybox", 0.f);
+        last_col[0] = -1.f;
     } else if (cfg.world_custom_fog) {
         CmdSet("fog_override", 1.f);
         CmdSet("fog_enable", 1.f);
         CmdSet("fog_enableskybox", 1.f);
         CmdSet("fog_start", cfg.fog_start);
         CmdSet("fog_end", cfg.fog_end);
-        CmdSet("fog_density", cfg.fog_density / 100.0f);
+        CmdSet("fog_density", cfg.fog_density);
         CmdSet("fog_startskybox", cfg.fog_start);
         CmdSet("fog_endskybox", cfg.fog_end);
-        CmdSet("fog_densityskybox", cfg.fog_density / 100.0f);
+        CmdSet("fog_densityskybox", cfg.fog_density);
 
-        static float last_col[3] = { -1, -1, -1 };
         if (last_col[0] != cfg.fog_color[0] || last_col[1] != cfg.fog_color[1] ||
             last_col[2] != cfg.fog_color[2]) {
             last_col[0] = cfg.fog_color[0]; last_col[1] = cfg.fog_color[1];
@@ -3129,15 +3516,31 @@ static void ApplyWorldVisuals() {
             snprintf(col, sizeof(col), "%d %d %d",
                 (int)(cfg.fog_color[0] * 255.0f), (int)(cfg.fog_color[1] * 255.0f),
                 (int)(cfg.fog_color[2] * 255.0f));
+#ifndef _WIN64
+            auto set_str = [&](const char* cname, const char* val) {
+                if (cvar.self) {
+                    if (ConVar* cv = cvar.FindVar(cname)) {
+                        int* flags = reinterpret_cast<int*>((char*)cv + 0x14);
+                        *flags &= ~(1 << 14);
+                        VFunc<void(THISCALL_CC*)(void*, const char*)>(cv, 11)(cv, val);
+                    }
+                }
+            };
+            set_str("fog_color", col);
+            set_str("fog_colorskybox", col);
+#else
             engine.ClientCmd(("fog_color " + std::string(col)).c_str());
             engine.ClientCmd(("fog_colorskybox " + std::string(col)).c_str());
+#endif
         }
     } else {
         CmdSet("fog_override", 0.f);
+        last_col[0] = -1.f;
     }
 
     // --- removals ---
     CmdSet("mat_postprocess_enable", cfg.rem_postprocess ? 0.f : 1.f);
+    CmdSet("mat_disable_bloom", cfg.rem_postprocess ? 1.f : 0.f);
     CmdSet("r_shadows", cfg.rem_shadows ? 0.f : 1.f);
     CmdSet("r_drawdecals", cfg.rem_decals ? 0.f : 1.f);
     CmdSet("r_drawdetailprops", cfg.rem_grass ? 0.f : 1.f);
@@ -3149,6 +3552,10 @@ static void ApplyWorldVisuals() {
     CmdSet("r_drawflecks", cfg.rem_debris ? 0.f : 1.f);
     CmdSet("r_drawparticles", cfg.rem_particles ? 0.f : 1.f);
     CmdSet("cl_ragdoll_physics_enable", cfg.rem_debris ? 0.f : 1.f);
+    CmdSet("violence_hblood", cfg.rem_blood ? 0.f : 1.f);
+    CmdSet("violence_ablood", cfg.rem_blood ? 0.f : 1.f);
+    CmdSet("violence_hgibs", cfg.rem_blood ? 0.f : 1.f);
+    CmdSet("violence_agibs", cfg.rem_blood ? 0.f : 1.f);
 
     // --- viewmodel ---
     CmdSet("viewmodel_fov", cfg.viewmodel_fov >= 1.0f ? cfg.viewmodel_fov : 0.f);
@@ -3206,6 +3613,7 @@ static LRESULT CALLBACK HookedWndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM
         ImGui_ImplWin32_WndProcHandler(hwnd, msg, wparam, lparam);
         if (cfg.menu_open) {
             switch (msg) {
+            case WM_INPUT:
             case WM_MOUSEMOVE:
             case WM_LBUTTONDOWN: case WM_LBUTTONUP:
             case WM_RBUTTONDOWN: case WM_RBUTTONUP:
@@ -3229,10 +3637,26 @@ static LRESULT CALLBACK HookedWndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM
 // ---------------------------------------------------------------------------
 typedef BOOL(WINAPI* SetCursorPosFn)(int, int);
 static SetCursorPosFn oSetCursorPos = nullptr;
+typedef BOOL(WINAPI* GetCursorPosFn)(LPPOINT);
+static GetCursorPosFn oGetCursorPos = nullptr;
+static HWND g_hwnd = nullptr;
 
 static BOOL WINAPI HookedSetCursorPos(int x, int y) {
     if (cfg.menu_open) return TRUE;
     return oSetCursorPos ? oSetCursorPos(x, y) : FALSE;
+}
+
+static BOOL WINAPI HookedGetCursorPos(LPPOINT pt) {
+    if (cfg.menu_open && pt && g_hwnd) {
+        RECT r{};
+        if (GetClientRect(g_hwnd, &r)) {
+            POINT c{ (r.left + r.right) / 2, (r.top + r.bottom) / 2 };
+            ClientToScreen(g_hwnd, &c);
+            *pt = c;
+            return TRUE;
+        }
+    }
+    return oGetCursorPos ? oGetCursorPos(pt) : FALSE;
 }
 
 static void PatchImport(HMODULE module, const char* dll_name, const char* func, void* hook, void** original) {
@@ -3276,12 +3700,15 @@ static void PatchImport(HMODULE module, const char* dll_name, const char* func, 
 }
 
 void InstallInputHooks() {
-    const char* modules[] = { "client.dll", "engine.dll", "inputsystem.dll", "vgui2.dll", "GameUI.dll", "serverbrowser.dll" };
+    const char* modules[] = { "client.dll", "engine.dll", "inputsystem.dll", "vguimatsurface.dll", "vgui2.dll", "GameUI.dll", "serverbrowser.dll" };
     for (const char* m : modules) {
         HMODULE mod = GetModuleHandleA(m);
-        if (mod) PatchImport(mod, "USER32.dll", "SetCursorPos", (void*)HookedSetCursorPos, (void**)&oSetCursorPos);
+        if (mod) {
+            PatchImport(mod, "USER32.dll", "SetCursorPos", (void*)HookedSetCursorPos, (void**)&oSetCursorPos);
+            PatchImport(mod, "USER32.dll", "GetCursorPos", (void*)HookedGetCursorPos, (void**)&oGetCursorPos);
+        }
     }
-    Log("input hooks: SetCursorPos=%p", oSetCursorPos);
+    Log("input hooks: SetCursorPos=%p GetCursorPos=%p", oSetCursorPos, oGetCursorPos);
 }
 
 // patches every import thunk whose resolved function pointer equals `target`
@@ -3342,6 +3769,7 @@ void InstallFakelagHook() {
 
 void InstallWindowHook(HWND hwnd) {
     if (!hwnd) { Log("window hook: no hwnd"); return; }
+    g_hwnd = hwnd;
     g_old_wndproc = (WNDPROC)SetWindowLongPtrA(hwnd, GWLP_WNDPROC, (LONG_PTR)HookedWndProc);
     Log("window hook installed (old %p)", g_old_wndproc);
 }
@@ -3351,34 +3779,129 @@ void InstallWindowHook(HWND hwnd) {
 // ---------------------------------------------------------------------------
 void InstallClientModeHooks() {
     if (!client_module) { Log("client mode hooks: no client.dll"); return; }
-    void** vt = reinterpret_cast<void**>((uintptr_t)client_module + CLIENTMODE_VTABLE_RVA);
 
     bool ok1 = false;
+    void** bcvt = nullptr;
     if (base_client) {
-        void** bcvt = *reinterpret_cast<void***>(base_client);
+        bcvt = *reinterpret_cast<void***>(base_client);
         ok1 = PatchVtable(bcvt, BASE_CLIENT_CREATE_MOVE, (void*)HookedBaseCreateMove, (void**)&oBaseCreateMove);
         bool ok9 = PatchVtable(bcvt, BASE_CLIENT_FRAME_STAGE, (void*)HookedFrameStageNotify, (void**)&oFrameStageNotify);
-        Log("baseclient vt[21] rva=%#llx  vt[35] rva=%#llx",
-            (unsigned long long)((uintptr_t)oBaseCreateMove - (uintptr_t)client_module),
-            (unsigned long long)((uintptr_t)oFrameStageNotify - (uintptr_t)client_module));
+        Log("baseclient vt[%d] rva=%#llx  vt[%d] rva=%#llx",
+            BASE_CLIENT_CREATE_MOVE, (unsigned long long)((uintptr_t)oBaseCreateMove - (uintptr_t)client_module),
+            BASE_CLIENT_FRAME_STAGE, (unsigned long long)((uintptr_t)oFrameStageNotify - (uintptr_t)client_module));
         if (!ok9) Log("frame stage hook failed");
     }
-    bool ok8 = PatchVtable(vt, CM_CREATE_MOVE, (void*)HookedClientModeCreateMove, (void**)&oClientModeCreateMove);
-    bool ok2 = PatchVtable(vt, CM_OVERRIDE_VIEW, (void*)HookedOverrideView, (void**)&oOverrideView);
-    bool ok3 = PatchVtable(vt, CM_SHOULD_DRAW_LOCAL_PLAYER, (void*)HookedShouldDrawLocalPlayer, (void**)&oShouldDrawLocalPlayer);
-    bool ok5 = PatchVtable(vt, 24, (void*)HookedShouldDrawViewModel, (void**)&oShouldDrawViewModel);
+
+#ifdef _WIN64
+    void** vt = reinterpret_cast<void**>((uintptr_t)client_module + CLIENTMODE_VTABLE_RVA);
+#else
+    void** vt = nullptr;
+    if (bcvt) {
+        uintptr_t const cbase = reinterpret_cast<uintptr_t>(client_module);
+        // VClient013: [7] HudProcessInput / [8] HudUpdate (never [10] HudText/gHUD)
+        for (int slot_idx = 7; slot_idx <= 8 && !vt; slot_idx++) {
+            const unsigned char* p = reinterpret_cast<const unsigned char*>(bcvt[slot_idx]);
+            if (!p) continue;
+            for (int i = 0; i < 24; i++) {
+                void* cand = nullptr;
+                int next_off = 0;
+                if (p[i] == 0x8B && p[i + 1] == 0x0D) {
+                    uintptr_t addr = *reinterpret_cast<const uintptr_t*>(p + i + 2);
+                    if (addr > cbase && addr < cbase + 0x2000000)
+                        cand = *reinterpret_cast<void**>(addr);
+                    next_off = i + 6;
+                } else if (p[i] == 0xB9) {
+                    uintptr_t addr = *reinterpret_cast<const uintptr_t*>(p + i + 1);
+                    if (addr > cbase && addr < cbase + 0x2000000)
+                        cand = reinterpret_cast<void*>(addr);
+                    next_off = i + 5;
+                }
+                if (cand && next_off > 0) {
+                    // Must be a tiny virtual-dispatch wrapper (mov eax, [ecx]; call/jmp [eax+...])
+                    bool has_vcall = false;
+                    for (int j = next_off; j < next_off + 12 && j < 32; j++) {
+                        if (p[j] == 0x8B && (p[j + 1] == 0x01 || p[j + 1] == 0x11)) {
+                            has_vcall = true;
+                            break;
+                        }
+                    }
+                    if (!has_vcall) continue;
+                    void** cand_vt = *reinterpret_cast<void***>(cand);
+                    uintptr_t vt_addr = reinterpret_cast<uintptr_t>(cand_vt);
+                    if (vt_addr > cbase && vt_addr < cbase + 0x2000000) {
+                        vt = cand_vt;
+                        Log("[hooks] v34 ClientMode=%p vt=%p (from bcvt[%d]+%d)", cand, vt, slot_idx, i);
+                        break;
+                    }
+                }
+            }
+        }
+        if (!vt) Log("[hooks] v34 ClientMode not found in bcvt[7..8] (skipping ClientMode hooks)");
+    }
+#endif
+    bool ok8 = vt ? PatchVtable(vt, CM_CREATE_MOVE, (void*)HookedClientModeCreateMove, (void**)&oClientModeCreateMove) : false;
+    bool ok2 = vt ? PatchVtable(vt, CM_OVERRIDE_VIEW, (void*)HookedOverrideView, (void**)&oOverrideView) : false;
+    bool ok3 = vt ? PatchVtable(vt, CM_SHOULD_DRAW_LOCAL_PLAYER, (void*)HookedShouldDrawLocalPlayer, (void**)&oShouldDrawLocalPlayer) : false;
+    bool ok5 = vt ? PatchVtable(vt, 24, (void*)HookedShouldDrawViewModel, (void**)&oShouldDrawViewModel) : false;
 
     bool ok6 = true;
 
-    // IVModelRender::DrawModelEx is vtable index 19 (VEngineModel016)
+    // IVModelRender vtable index 19 (DrawModelExecute on x64 / DrawModelEx on v34)
     bool ok4 = false;
     if (model_render.self) {
+        WriteChamsVmts();
         void** mvt = *reinterpret_cast<void***>(model_render.self);
         ok4 = PatchVtable(mvt, 19, (void*)HookedDrawModelExecute, (void**)&oDrawModelExecute);
         WorldFx_Install( );
         InstallGameEvents( );
     }
 
+    // IPanel::PaintTraverse hook (x64) / CHudScope::Paint vtable patch (v34) to remove scope overlay
+#ifdef _WIN64
+    {
+        typedef void(THISCALL_CC* PaintTraverseFn)(void*, uintptr_t, bool, bool);
+        static PaintTraverseFn oPaintTraverse = nullptr;
+        static uintptr_t g_scope_panel = 0;
+        static auto HookedPaintTraverse = [](void* self, uintptr_t vgui_panel, bool force_repaint, bool allow_force) -> void {
+            if (cfg.rem_scope && vgui_panel) {
+                if (!g_scope_panel) {
+                    const char* pname = VFunc<const char*(THISCALL_CC*)(void*, uintptr_t)>(self, 36)(self, vgui_panel);
+                    if (pname && (strstr(pname, "HudZoom") != nullptr || strstr(pname, "HudScope") != nullptr)) {
+                        g_scope_panel = vgui_panel;
+                        Log("[scope] matched panel '%s' (0x%p)", pname, (void*)vgui_panel);
+                    }
+                }
+                if (vgui_panel == g_scope_panel)
+                    return;
+            }
+            if (oPaintTraverse)
+                oPaintTraverse(self, vgui_panel, force_repaint, allow_force);
+        };
+        if (HMODULE vgui2 = GetModuleHandleA("vgui2.dll")) {
+            if (void* panel = GetInterface(vgui2, "VGUI_Panel009")) {
+                void** pvt = *reinterpret_cast<void***>(panel);
+                if (pvt) {
+                    bool ok_pt = PatchVtable(pvt, 41, (void*)+HookedPaintTraverse, (void**)&oPaintTraverse);
+                    Log("[scope] PaintTraverse hook=%d", ok_pt ? 1 : 0);
+                }
+            }
+        }
+    }
+#else
+    if (client_module) {
+        typedef void(__thiscall* HudScopePaintFn)(void*);
+        static HudScopePaintFn oHudScopePaint = nullptr;
+        static auto HookedHudScopePaint = [](void* self, void*) __attribute__((fastcall)) -> void {
+            if (cfg.rem_scope) return;
+            if (oHudScopePaint) oHudScopePaint(self);
+        };
+        void** slot = reinterpret_cast<void**>((uintptr_t)client_module + 0x33c120);
+        bool ok_sc = PatchVtable(slot, 0, (void*)+HookedHudScopePaint, (void**)&oHudScopePaint);
+        Log("[scope] v34 CHudScope::Paint hook=%d orig=%p", ok_sc ? 1 : 0, (void*)oHudScopePaint);
+    }
+#endif
+
+#ifdef _WIN64
     // C_CSPlayer::ValidateModelIndex is vtable index 45 (prevents cl_minmodels
     // from overriding the local player's custom model index mid-frame).
     typedef void(__fastcall* ValidateModelIndexFn)(void*);
@@ -3400,6 +3923,9 @@ void InstallClientModeHooks() {
     };
     void** cs_vt = reinterpret_cast<void**>((uintptr_t)client_module + CS_PLAYER_VTABLE_RVA);
     bool ok11 = PatchVtable(cs_vt, 45, (void*)(void(*)(void*))HookedValidateModelIndex, (void**)&oValidateModelIndex);
+#else
+    bool ok11 = false;
+#endif
 
     Log("hooks: base_create=%d mode_create=%d override=%d drawlocal=%d drawmodel=%d valmodel=%d viewmodel=%d viewangles=%d",
         ok1, ok8, ok2, ok3, ok4, ok11, ok5, ok6);
@@ -3423,7 +3949,9 @@ typedef HRESULT(WINAPI* ResetFn)(IDirect3DDevice9*, D3DPRESENT_PARAMETERS*);
 static EndSceneFn oEndScene = nullptr;
 static ResetFn oReset = nullptr;
 static IDirect3DDevice9* g_device = nullptr;
+static IDirect3DDevice9* g_imgui_device = nullptr;
 static bool g_imgui_init = false;
+static bool g_alice_init = false;
 
 static LRESULT CALLBACK DummyWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     return DefWindowProcA(h, m, w, l);
@@ -3444,26 +3972,40 @@ static void InitImGui(IDirect3DDevice9* device) {
     void* hwnd = game_window ? (void*)game_window : (void*)GetActiveWindow();
     ImGui_ImplWin32_Init(hwnd);
     ImGui_ImplDX9_Init(device);
+    g_imgui_device = device;
     g_imgui_win32_ready = true;
     g_imgui_init = true;
 
     int sw = 0, sh = 0;
     engine.GetScreenSize(sw, sh);
     if (sw <= 0 || sh <= 0) { sw = 1920; sh = 1080; }
+    bool const was_open = cfg.menu_open;
     alice_ui::Init(device, sw, sh);
+    cfg.menu_open = was_open;
+    g_alice_init = true;
 
     Log("imgui initialized (hwnd=%p device=%p)", hwnd, device);
 }
 
 static HRESULT WINAPI HookedReset(IDirect3DDevice9* device, D3DPRESENT_PARAMETERS* pp) {
-    if (g_imgui_init)
-        alice_ui::OnLostDevice( );
+    if (g_alice_init)
+        alice_ui::OnLostDevice();
     if (g_imgui_init)
         ImGui_ImplDX9_InvalidateDeviceObjects();
     HRESULT hr = oReset ? oReset(device, pp) : D3D_OK;
+    Log("[d3d9] Reset %ux%u windowed=%d -> hr=0x%08x",
+        pp ? (unsigned)pp->BackBufferWidth : 0u,
+        pp ? (unsigned)pp->BackBufferHeight : 0u,
+        pp ? (int)pp->Windowed : -1,
+        (unsigned)hr);
     if (g_imgui_init && SUCCEEDED(hr)) {
+        g_imgui_device = device;
         ImGui_ImplDX9_CreateDeviceObjects();
-        alice_ui::OnResetDevice(device, (int)pp->BackBufferWidth, (int)pp->BackBufferHeight);
+        if (g_alice_init) {
+            int const w = (pp && pp->BackBufferWidth > 0) ? (int)pp->BackBufferWidth : 1920;
+            int const h = (pp && pp->BackBufferHeight > 0) ? (int)pp->BackBufferHeight : 1080;
+            alice_ui::OnResetDevice(device, w, h);
+        }
     }
     return hr;
 }
@@ -3475,6 +4017,44 @@ static ImU32 EspFeedColor(float a) {
 
 static void DrawOverlays(ImDrawList* draw, int w, int h) {
     ImGuiIO& io = ImGui::GetIO();
+
+    // Scope override / custom scope lines (claret/killed style)
+    if (cfg.rem_scope && IsGameReady()) {
+        void* local = GetLocalEntity();
+        bool scoped = false;
+        if (local && *reinterpret_cast<const char*>((const char*)local + off::m_lifeState) == 0 &&
+            *reinterpret_cast<const int*>((const char*)local + off::m_iObserverMode) == 0) {
+#ifdef _WIN64
+            scoped = (*reinterpret_cast<const int*>((const char*)local + off::m_bIsScoped) != 0);
+#else
+            int const fov = *reinterpret_cast<const int*>((const char*)local + off::m_iFOV);
+            scoped = (fov > 0 && fov < 90);
+#endif
+        }
+        if (scoped) {
+            if (!cfg.custom_scope) {
+                float const cx = floorf((float)w * 0.5f) + 0.5f;
+                float const cy = floorf((float)h * 0.5f) + 0.5f;
+                ImU32 const col = IM_COL32(0, 0, 0, 255);
+                draw->AddLine(ImVec2(0.f, cy), ImVec2((float)w, cy), col);
+                draw->AddLine(ImVec2(cx, 0.f), ImVec2(cx, (float)h), col);
+            } else {
+                float const cx = floorf((float)w * 0.5f);
+                float const cy = floorf((float)h * 0.5f);
+                float const inner = (float)(cfg.scope_gap + 12);
+                float const outer = inner + (float)cfg.scope_length;
+                ImVec4 c(cfg.custom_scope_color[0], cfg.custom_scope_color[1],
+                         cfg.custom_scope_color[2], cfg.custom_scope_color[3]);
+                ImVec4 tr(c.x, c.y, c.z, 0.f);
+                ImU32 const near_col = ImGui::ColorConvertFloat4ToU32(cfg.scope_invert ? tr : c);
+                ImU32 const far_col  = ImGui::ColorConvertFloat4ToU32(cfg.scope_invert ? c : tr);
+                draw->AddRectFilledMultiColor(ImVec2(cx + inner, cy), ImVec2(cx + outer, cy + 1.f), near_col, far_col, far_col, near_col);
+                draw->AddRectFilledMultiColor(ImVec2(cx - outer + 1.f, cy), ImVec2(cx - inner + 1.f, cy + 1.f), far_col, near_col, near_col, far_col);
+                draw->AddRectFilledMultiColor(ImVec2(cx, cy + inner), ImVec2(cx + 1.f, cy + outer), near_col, near_col, far_col, far_col);
+                draw->AddRectFilledMultiColor(ImVec2(cx, cy - outer + 1.f), ImVec2(cx + 1.f, cy - inner + 1.f), far_col, far_col, near_col, near_col);
+            }
+        }
+    }
 
     if (cfg.watermark) {
         char text[96];
@@ -3632,13 +4212,20 @@ static void RenderOverlay(IDirect3DDevice9* device) {
         ImguiMenuIslands(ImGui::GetForegroundDrawList(),
                          (int)ImGui::GetIO().DisplaySize.x, (int)ImGui::GetIO().DisplaySize.y);
     } else {
+        if (!g_alice_init && device) {
+            int sw = 0, sh = 0;
+            engine.GetScreenSize(sw, sh);
+            if (sw <= 0 || sh <= 0) { sw = 1920; sh = 1080; }
+            alice_ui::Init(device, sw, sh);
+            g_alice_init = true;
+        }
         alice_ui::Render();
     }
 
     // night mode is world-pinned now: it darkens through r_ambientfraction /
     // r_3dsky in ApplyWorldVisuals instead of a fullscreen screen tint
 
-    if ((cfg.esp || cfg.esp_skeleton) && IsGameReady()) {
+    if ((cfg.esp || cfg.esp_skeleton || cfg.esp_bomb) && IsGameReady()) {
         SetStage("ESP");
         ImDrawList* draw = ImGui::GetBackgroundDrawList();
         draw->Flags &= ~(ImDrawListFlags_AntiAliasedLines | ImDrawListFlags_AntiAliasedFill);
@@ -3679,21 +4266,36 @@ static HRESULT WINAPI HookedEndScene(IDirect3DDevice9* device) {
     g_device = device;
 
     if ( !g_imgui_init ) {
-        if ( view_valid && IsGameReady( ) )
+        if ( IsGameReady( ) )
             InitImGui( device );
+    } else if ( g_imgui_device != device ) {
+        Log("[d3d9] device changed %p -> %p, rebinding ImGui DX9", g_imgui_device, device);
+        if (g_alice_init) {
+            alice_ui::Shutdown();
+            g_alice_init = false;
+        }
+        ImGui_ImplDX9_Shutdown();
+        ImGui_ImplDX9_Init(device);
+        g_imgui_device = device;
     }
 
     ApplyFeatureBinds();
     UpdateThirdPerson();
     InstallStaticPropTint();
-    SetStage("WorldVisuals");
-    ApplyWorldVisuals();
-    WorldFx_ApplyWalls();
-    SetStage("ChamsOcclusion");
-    UpdateChamsOcclusion();
+    static DWORD last_world_fx_tick = 0;
+    DWORD const now_es = GetTickCount();
+    if (now_es - last_world_fx_tick >= 50) {
+        last_world_fx_tick = now_es;
+        SetStage("WorldVisuals");
+        ApplyWorldVisuals();
+        WorldFx_ApplyWalls();
+        SetStage("ChamsOcclusion");
+        UpdateChamsOcclusion();
+    }
     UpdateHitChams();
 
     RenderOverlay(device);
+    SetStage("idle");
 
     return oEndScene ? oEndScene(device) : D3D_OK;
 }
@@ -3798,6 +4400,9 @@ static bool PatchPropStore(uintptr_t engine_base, uintptr_t site_rva, uintptr_t 
 }
 
 static void InstallStaticPropTint() {
+#ifndef _WIN64
+    return;
+#else
     if (!engine_module || oStaticPropDrawModel) return;
     uintptr_t const base = (uintptr_t)engine_module;
     uintptr_t const target = base + 0x203420; // CStaticProp::DrawModel
@@ -3840,6 +4445,7 @@ static void InstallStaticPropTint() {
     bool const bl = PatchPropStore(base, 0x203918, 0x4713f0, &g_prop_tint_rgb[2], 3, g_prop_stub_mem + 0x100);
     bool const g = PatchPropStore(base, 0x203920, 0x4713ec, &g_prop_tint_rgb[1], 0, g_prop_stub_mem + 0x1c0);
     Log("[world] static prop tint stores r=%d g=%d b=%d", r ? 1 : 0, g ? 1 : 0, bl ? 1 : 0);
+#endif
 }
 
 void InstallD3D9Hook() {
