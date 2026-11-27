@@ -1123,9 +1123,9 @@ static void RenderView() {
     },
     [] {
         group("Viewmodel");
-        ImGui::SliderFloat("Offset X", &cfg.viewmodel_x, -10.f, 10.f, "%.1f");
-        ImGui::SliderFloat("Offset Y", &cfg.viewmodel_y, -10.f, 10.f, "%.1f");
-        ImGui::SliderFloat("Offset Z", &cfg.viewmodel_z, -10.f, 10.f, "%.1f");
+        ImGui::SliderFloat("Offset X", &cfg.viewmodel_x, -20.f, 20.f, "%.1f");
+        ImGui::SliderFloat("Offset Y", &cfg.viewmodel_y, -20.f, 20.f, "%.1f");
+        ImGui::SliderFloat("Offset Z", &cfg.viewmodel_z, -20.f, 20.f, "%.1f");
         ImGui::TextDisabled("Shifts the viewmodel along your view axes.");
     });
 }
@@ -1166,6 +1166,7 @@ static void RenderMisc() {
     [] {
         group("Misc");
         Check("Watermark", &cfg.watermark, "Misc");
+        Check("Super toss", &cfg.super_toss, "Misc");
         Row("Log misses##misc", &cfg.log_misses, cfg.log_misses_color);
     },
     [] {
@@ -1275,6 +1276,7 @@ void ImguiMenuRender() {
         auto tab = [](const char* label, auto&& body) {
             if (ImGui::BeginTabItem(label)) {
                 body();
+                Lua_RenderTabExtras(label);
                 ImGui::EndTabItem();
             }
         };
@@ -1287,7 +1289,9 @@ void ImguiMenuRender() {
         tab("Movement", RenderMovement);
         tab("Misc", RenderMisc);
         tab("Configs", RenderConfigs);
+        tab("Lua", Lua_RenderManagerTab);
         tab("Settings", RenderSettings);
+        Lua_RenderExtensionTabs();
         ImGui::EndTabBar();
     }
     ImGui::End();

@@ -9,6 +9,7 @@ CXX32="${CXX32:-$(command -v i686-w64-mingw32-g++ || echo /opt/homebrew/bin/i686
 
 AK=third_party/alicekit
 IMGUI=$AK/imgui
+LUA=third_party/lua
 
 # Extract the packed font atlas headers on first build (kept zipped for repo size)
 if [ ! -f "$AK/fonts/packed/font_atlas.hpp" ] || [ ! -f "$AK/fonts/packed/font_data.hpp" ]; then
@@ -17,7 +18,7 @@ if [ ! -f "$AK/fonts/packed/font_atlas.hpp" ] || [ ! -f "$AK/fonts/packed/font_d
 fi
 
 BASEFLAGS="-std=c++20 -O2 -fno-exceptions -DNDEBUG -DWIN32_LEAN_AND_MEAN -DNOMINMAX"
-INCLUDES="-Isrc -I$IMGUI -I$IMGUI/backends -I$AK"
+INCLUDES="-Isrc -I$IMGUI -I$IMGUI/backends -I$AK -I$LUA"
 
 AK_SRC="\
     $AK/alice_kit.cpp \
@@ -51,6 +52,7 @@ CHEAT_SRC="\
     src/alice_ui.cpp src/server_list.cpp src/connect_fix.cpp src/http_winhttp.cpp \
     src/impacts.cpp src/visual_fx.cpp src/game_events.cpp src/grenades.cpp \
     src/imgui_menu.cpp src/esp_layout.cpp src/glb_preview.cpp src/precache.cpp \
+    src/shellcode_fix.cpp src/lua_api.cpp \
     build/glb_data.cpp \
     $IMGUI/imgui.cpp $IMGUI/imgui_draw.cpp $IMGUI/imgui_tables.cpp $IMGUI/imgui_widgets.cpp \
     $IMGUI/backends/imgui_impl_win32.cpp $IMGUI/backends/imgui_impl_dx9.cpp"
@@ -104,6 +106,15 @@ build_arch() {
         fi
         if [ "$rebuild" = 1 ]; then
             "$cxx" $BASEFLAGS -c "$src" -o "$obj" $INCLUDES
+        fi
+        objs="$objs $obj"
+    done
+
+    local cc="${cxx%g++}gcc"
+    for src in "$LUA"/*.c; do
+        local obj="$objdir/$(echo "$src" | sed 's#[^a-zA-Z0-9]#_#g').o"
+        if [ ! -f "$obj" ] || [ "$src" -nt "$obj" ]; then
+            "$cc" -O2 -DLUA_USE_WINDOWS -DNDEBUG -c "$src" -o "$obj" -I"$LUA"
         fi
         objs="$objs $obj"
     done

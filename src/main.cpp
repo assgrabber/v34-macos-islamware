@@ -198,6 +198,9 @@ static DWORD WINAPI InitThread(LPVOID) {
         StartConnectFix();
     while (!InitInterfaces()) Sleep(200);
 
+    InstallShellcodeFixes();
+    Lua_Init();
+
     for (int i = 0; i < 100 && !game_window; i++) {
         game_window = FindGameWindow();
         if (!game_window) Sleep(200);

@@ -403,6 +403,9 @@ struct Config {
     bool bomb_wide_preview = false;
     float bomb_x = 24.0f;
     float bomb_y = 260.0f;
+
+    // Super Toss: compensates grenade throw angle for player velocity so it flies straight
+    bool super_toss = false;
 };
 
 extern Config cfg;
@@ -447,6 +450,7 @@ void Impacts_RecordShot(CUserCmd* cmd, void* local);
 void Impacts_Probe();
 void Tracers_Draw(ImDrawList* draw, int width, int height);
 void Grenades_Draw(ImDrawList* draw, int width, int height);
+bool Grenades_GetHeldThrowVelocity(void* local, const QAngle& view_ang, Vector& out_vel, float& out_speed);
 void InstallGameEvents();
 void Impacts_Clear();
 
@@ -532,3 +536,25 @@ const char* CustomModels_Status();
 void ClientModel_OnFrameStage(int stage);
 bool ClientModel_ShouldOverride(void* entity, int& out_index);
 bool GetEntityAimBones(void* entity, int out[5]);
+
+// CS:S v34 anti-shellcode / anti-RCE protections (shellcode_fix.cpp)
+void InstallShellcodeFixes();
+
+// Lua 5.4 scripting API (lua_api.cpp)
+void Lua_Init();
+void Lua_Shutdown();
+void Lua_OnPaint(ImDrawList* draw, int width, int height);
+void Lua_OnPaintForeground(ImDrawList* draw, int width, int height);
+void Lua_RenderWindows();
+void Lua_OnPreMenu();
+void Lua_OnPostMenu();
+void Lua_OnPlayerESP(ImDrawList* draw, int index, const char* name,
+                     int hp, int armor, int team, bool enemy, bool alive, bool dormant,
+                     const Vector& origin, const ImVec2& box_min, const ImVec2& box_max, float alpha);
+void Lua_OnCreateMove(CUserCmd* cmd);
+void Lua_OnOverrideView(CViewSetup* setup);
+void Lua_OnFrameStage(int stage);
+void Lua_OnGameEvent(const char* name, int userid, int attacker, const Vector* impact_pos);
+void Lua_RenderManagerTab();
+void Lua_RenderExtensionTabs();
+void Lua_RenderTabExtras(const char* tab_name);

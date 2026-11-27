@@ -1652,6 +1652,7 @@ TYPEDEF_THISCALL(void, FrameStageNotifyFn, void*, int);
 static FrameStageNotifyFn oFrameStageNotify = nullptr;
 
 static HOOK_THISCALL(void, HookedFrameStageNotify, void*, int stage) {
+    SetStage("FrameStageNotify");
     ForceSvCheats();
     // Anti-aim / third-person run at stage 6 exactly like islamware-css-b
     // (its FRAME_RENDER_START constant was 6); custom model work uses 5/6.
@@ -1692,6 +1693,7 @@ static HOOK_THISCALL(void, HookedFrameStageNotify, void*, int stage) {
         }
     }
     if (oFrameStageNotify) oFrameStageNotify(self, stage);
+    Lua_OnFrameStage(stage);
     if (stage == FRAME_RENDER_START)
         Bones_OnFrameStage();
     if (stage == 4 /* FRAME_NET_UPDATE_POSTDATAUPDATE_END */ || stage == FRAME_RENDER_END)
@@ -2290,6 +2292,41 @@ static HOOK_THISCALL(void, HookedBaseCreateMove, void*, int sequence_number, flo
     if (cfg.aa_enabled && !attacking_now && !knife_applied)
         RunAntiAim(cmd, real_view_angles);
 
+    // Super Toss: compensate grenade throw angle for player velocity so the
+    // grenade launches straight along the camera direction regardless of strafing.
+    if (cfg.super_toss && local && *reinterpret_cast<char*>((char*)local + off::m_lifeState) == 0) {
+        static bool s_nade_pulled = false;
+        static int s_nade_btns = 0;
+        static int s_nade_release = 0;
+        Vector dummy_check;
+        float probe_btns = (float)IN_ATTACK;
+        bool const holding_nade = Grenades_GetHeldThrowVelocity(local, real_view_angles, dummy_check, probe_btns);
+        if (!holding_nade) {
+            s_nade_pulled = false;
+            s_nade_release = 0;
+        } else {
+            int const atk_btns = cmd->buttons & (IN_ATTACK | IN_ATTACK2);
+            if (atk_btns) {
+                s_nade_pulled = true;
+                s_nade_btns = atk_btns;
+                s_nade_release = 0;
+            } else if (s_nade_pulled) {
+                s_nade_pulled = false;
+                s_nade_release = 2;
+            }
+            if (s_nade_release > 0) {
+                s_nade_release--;
+                Vector comp_ang_vec;
+                float btns_f = (float)s_nade_btns;
+                if (Grenades_GetHeldThrowVelocity(local, real_view_angles, comp_ang_vec, btns_f)) {
+                    cmd->viewangles.x = comp_ang_vec.x;
+                    cmd->viewangles.y = comp_ang_vec.y;
+                    cmd->viewangles.z = 0.0f;
+                }
+            }
+        }
+    }
+
     RunExtraMovement(cmd, local, user_camera_angles);
     RunPeekAssist(cmd, local, user_camera_angles, raw_buttons, raw_forward, raw_side,
                   attacking_now || silent_applied || shot_fired_clip);
@@ -2298,6 +2335,8 @@ static HOOK_THISCALL(void, HookedBaseCreateMove, void*, int sequence_number, flo
     // seed-based spread & recoil compensation (after silent aim sets the shot angle)
     if (attacking_now && !knife_applied)
         RunNoSpread(cmd, cfg.nospread, silent_applied || cfg.nospread);
+
+    Lua_OnCreateMove(cmd);
 
     // The engine sends the +0x110 command copy, not the +0x108 array returned
     // by GetUserCmd, so mirror the final command into it.
@@ -2314,6 +2353,7 @@ static HOOK_THISCALL(void, HookedBaseCreateMove, void*, int sequence_number, flo
 }
 
 HOOK_THISCALL(void, HookedOverrideView, void*, CViewSetup* setup) {
+    SetStage("OverrideView");
     if (oOverrideView) oOverrideView(self, setup);
     if (!setup) return;
 
@@ -2327,7 +2367,7 @@ HOOK_THISCALL(void, HookedOverrideView, void*, CViewSetup* setup) {
         *reinterpret_cast<const char*>((const char*)local_ov + off::m_lifeState) == 0 &&
         *reinterpret_cast<const int*>((const char*)local_ov + off::m_iObserverMode) == 0;
 
-    if ((cfg.aa_enabled || cfg.silentaim) && local_alive_ov) {
+    if ((cfg.aa_enabled || cfg.silentaim || cfg.super_toss) && local_alive_ov) {
         // engine.dll keeps the view angles in a global (rva 0x53E4E4) that
         // CInput uses as next tick's mouse base.  The fake cmd angles were just
         // copied into it; restore the real view so the camera cannot drift or
@@ -2400,6 +2440,8 @@ HOOK_THISCALL(void, HookedOverrideView, void*, CViewSetup* setup) {
 
     if (cfg.fake_duck && local_alive_ov)
         setup->origin.z += 36.0f; // server sees crouched, camera stays standing
+
+    Lua_OnOverrideView(setup);
 
     view_origin = setup->origin;
     view_angles = setup->angles;
@@ -2844,6 +2886,57 @@ static void UpdateHitChams( ) {
     }
 }
 
+static void* g_vm_renderable = nullptr;
+#ifndef _WIN64
+typedef const Vector& (__thiscall* VmGetRenderOriginFn)(void*);
+typedef bool (__thiscall* VmSetupBonesFn)(void*, matrix3x4_t*, int, int, float);
+static VmGetRenderOriginFn oVmGetRenderOrigin = nullptr;
+static VmSetupBonesFn oVmSetupBones = nullptr;
+static void** g_vm_vtable_hooked = nullptr;
+
+static const Vector& __fastcall HookedVmGetRenderOrigin(void* renderable, void* /*edx*/) {
+    static Vector s_shifted;
+    const Vector& orig = oVmGetRenderOrigin(renderable);
+    if (renderable == g_vm_renderable &&
+        (cfg.viewmodel_x != 0.0f || cfg.viewmodel_y != 0.0f || cfg.viewmodel_z != 0.0f)) {
+        Vector fwd, right, up;
+        AngleVectors(view_angles, fwd, right, up);
+        s_shifted = orig + right * cfg.viewmodel_x + up * cfg.viewmodel_y + fwd * cfg.viewmodel_z;
+        return s_shifted;
+    }
+    return orig;
+}
+
+static bool __fastcall HookedVmSetupBones(void* renderable, void* /*edx*/, matrix3x4_t* out, int max_bones, int mask, float cur_time) {
+    bool ok = oVmSetupBones(renderable, out, max_bones, mask, cur_time);
+    if (ok && out && max_bones > 0 && renderable == g_vm_renderable &&
+        (cfg.viewmodel_x != 0.0f || cfg.viewmodel_y != 0.0f || cfg.viewmodel_z != 0.0f)) {
+        Vector fwd, right, up;
+        AngleVectors(view_angles, fwd, right, up);
+        Vector const offset = right * cfg.viewmodel_x + up * cfg.viewmodel_y + fwd * cfg.viewmodel_z;
+        int n = max_bones > 128 ? 128 : max_bones;
+        for (int i = 0; i < n; i++) {
+            out[i].m[0][3] += offset.x;
+            out[i].m[1][3] += offset.y;
+            out[i].m[2][3] += offset.z;
+        }
+    }
+    return ok;
+}
+
+static void EnsureViewModelHooks(void* renderable) {
+    if (!renderable) return;
+    g_vm_renderable = renderable;
+    void** vt = *reinterpret_cast<void***>(renderable);
+    if (!vt || vt == g_vm_vtable_hooked) return;
+    if (vt[1] && vt[1] != (void*)HookedVmGetRenderOrigin)
+        PatchVtable(vt, 1, (void*)HookedVmGetRenderOrigin, (void**)&oVmGetRenderOrigin);
+    if (vt[15] && vt[15] != (void*)HookedVmSetupBones)
+        PatchVtable(vt, 15, (void*)HookedVmSetupBones, (void**)&oVmSetupBones);
+    g_vm_vtable_hooked = vt;
+}
+#endif
+
 static int DrawModelExecuteInner( void* self, void* state, ModelRenderInfo_t* info, void* bones );
 
 #ifdef _WIN64
@@ -2861,6 +2954,13 @@ int __fastcall HookedDrawModelExecute( void* self, void* /*edx*/, ModelRenderInf
     auto is_vm_model = [&](const char* m) -> bool {
         return m && (strstr(m, "/v_") || strstr(m, "\\v_"));
     };
+
+#ifndef _WIN64
+    if (IsGameReady() && info->pRenderable &&
+        (cfg.viewmodel_x != 0.0f || cfg.viewmodel_y != 0.0f || cfg.viewmodel_z != 0.0f) &&
+        is_vm_model(info_model))
+        EnsureViewModelHooks(info->pRenderable);
+#endif
 
     // Viewmodel position offset: the mesh is drawn through the bone matrices,
     // so shifting info->origin alone did nothing - translate the bones too.
@@ -2965,7 +3065,7 @@ static int DrawModelExecuteInner( void* self, void* state, ModelRenderInfo_t* in
         return dme_model && (strstr(dme_model, "/v_") || strstr(dme_model, "\\v_"));
     };
 
-    if ( dme_local && ( cfg.viewmodel_x != 0.0f || cfg.viewmodel_y != 0.0f || cfg.viewmodel_z != 0.0f ) ) {
+    if ( dme_local && !bones && ( cfg.viewmodel_x != 0.0f || cfg.viewmodel_y != 0.0f || cfg.viewmodel_z != 0.0f ) ) {
         if ( is_vm_draw(dme_vm_index) ) {
                 Vector fwd, right, up;
                 AngleVectors( view_angles, fwd, right, up );
@@ -3459,7 +3559,8 @@ static void ApplyWorldVisuals() {
     // for every cvar sent at startup.  Only issue commands when a toggle is on
     // (or once when turning everything back off to restore defaults).
     static bool was_world_active = false;
-    bool const world_active = g_world_needs_cheats || cfg.world_bloom != 1.0f || cfg.viewmodel_fov != 0.0f;
+    bool const world_active = g_world_needs_cheats || cfg.world_bloom != 1.0f || cfg.viewmodel_fov != 0.0f ||
+                              cfg.left_hand || cfg.remove_bob;
     if (!world_active && !was_world_active)
         return;
     was_world_active = world_active;
@@ -4205,8 +4306,13 @@ static void RenderOverlay(IDirect3DDevice9* device) {
         Log("[menu] style: %s (menu_imgui=%d)", cfg.menu_imgui ? "imgui" : "alicekit", cfg.menu_imgui ? 1 : 0);
     }
     if (cfg.menu_imgui) {
-        if (cfg.menu_open)
+        if (cfg.menu_open) {
+            Lua_OnPreMenu();
             ImguiMenuRender();
+            Lua_OnPostMenu();
+        }
+        // Standalone Lua ImGui windows render even when the main menu is closed
+        Lua_RenderWindows();
         // hud islands: the hotkey window also spawns while the menu is closed
         // (whenever a bind is engaged) - visibility is handled inside
         ImguiMenuIslands(ImGui::GetForegroundDrawList(),
@@ -4220,6 +4326,7 @@ static void RenderOverlay(IDirect3DDevice9* device) {
             g_alice_init = true;
         }
         alice_ui::Render();
+        Lua_RenderWindows();
     }
 
     // night mode is world-pinned now: it darkens through r_ambientfraction /
@@ -4242,7 +4349,17 @@ static void RenderOverlay(IDirect3DDevice9* device) {
         Grenades_Draw(draw, w, h);
         PeekAssist_Draw(draw, w, h);
         DrawOverlays(draw, w, h);
+        Lua_OnPaint(draw, w, h);
+    } else {
+        ImDrawList* draw = ImGui::GetBackgroundDrawList();
+        int const w = (int)ImGui::GetIO().DisplaySize.x;
+        int const h = (int)ImGui::GetIO().DisplaySize.y;
+        Lua_OnPaint(draw, w, h);
     }
+
+    Lua_OnPaintForeground(ImGui::GetForegroundDrawList(),
+                          (int)ImGui::GetIO().DisplaySize.x,
+                          (int)ImGui::GetIO().DisplaySize.y);
 
     if (cfg.menu_open) {
         ImVec2 const m = ImGui::GetIO().MousePos;

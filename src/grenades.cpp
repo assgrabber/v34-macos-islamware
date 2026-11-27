@@ -220,15 +220,86 @@ void Simulate(void* local, int type, const Vector& start, const Vector& velocity
     g_path.end = pos;
 }
 
+static void ComputeThrowParams(const QAngle& camera, int buttons, QAngle& out_throw_ang, float& out_speed) {
+    float pitch = camera.x;
+    if (pitch > 180.0f) pitch -= 360.0f;
+    float throw_pitch = -10.0f + pitch * (100.0f / 90.0f);
+    if (throw_pitch > 89.0f) throw_pitch = 89.0f;
+    if (throw_pitch < -89.0f) throw_pitch = -89.0f;
+
+    float base_vel = (90.0f - throw_pitch) * 6.0f;
+    if (base_vel > 750.0f) base_vel = 750.0f;
+    if (base_vel < 100.0f) base_vel = 100.0f;
+
+    float strength = 0.9f;
+    bool const atk1 = (buttons & IN_ATTACK) != 0;
+    bool const atk2 = (buttons & IN_ATTACK2) != 0;
+    if (atk1 && atk2) strength = 0.6f;
+    else if (atk2)    strength = 0.3f;
+
+    out_throw_ang = QAngle(throw_pitch, camera.y, 0.0f);
+    out_speed = base_vel * strength;
+}
+
+static bool ComputeSuperTossInternal(void* local, const QAngle& camera, int buttons,
+                                     QAngle& out_cmd_angles, Vector& out_result_vel) {
+    QAngle throw_ang;
+    float speed = 675.0f;
+    ComputeThrowParams(camera, buttons, throw_ang, speed);
+
+    Vector u;
+    AngleVectors(throw_ang, u);
+
+    Vector const vel = *reinterpret_cast<Vector*>((char*)local + off::m_vecVelocity);
+    Vector const carry = vel * 1.25f;
+    Vector const w(carry.x / speed, carry.y / speed, carry.z / speed);
+
+    float const uw = u.x * w.x + u.y * w.y + u.z * w.z;
+    float const ww = w.x * w.x + w.y * w.y + w.z * w.z;
+    float const disc = uw * uw - (ww - 1.0f);
+
+    Vector comp;
+    if (disc >= 0.0f) {
+        float const k = uw + sqrtf(disc);
+        comp = Vector(k * u.x - w.x, k * u.y - w.y, k * u.z - w.z);
+    } else {
+        comp = Vector(u.x - w.x, u.y - w.y, u.z - w.z);
+    }
+    float const len = sqrtf(comp.x * comp.x + comp.y * comp.y + comp.z * comp.z);
+    if (len < 1e-5f) {
+        out_cmd_angles = camera;
+        out_result_vel = u * speed + carry;
+        return false;
+    }
+    comp.x /= len; comp.y /= len; comp.z /= len;
+
+    float const comp_throw_pitch = -atan2f(comp.z, sqrtf(comp.x * comp.x + comp.y * comp.y)) * 57.29577951308232f;
+    float const comp_yaw = atan2f(comp.y, comp.x) * 57.29577951308232f;
+
+    float cmd_pitch = (comp_throw_pitch + 10.0f) * (90.0f / 100.0f);
+    if (cmd_pitch > 89.0f) cmd_pitch = 89.0f;
+    if (cmd_pitch < -89.0f) cmd_pitch = -89.0f;
+
+    out_cmd_angles = QAngle(cmd_pitch, comp_yaw, 0.0f);
+    out_result_vel = comp * speed + carry;
+    return true;
+}
+
 void RebuildHeld(void* local, int type) {
     Vector const eye = PlayerEye(local);
     Vector fwd;
     AngleVectors(real_view_angles, fwd);
 
     Vector const start = eye + fwd * 16.0f;
-    Vector const carry = *reinterpret_cast<Vector*>((char*)local + off::m_vecVelocity) * 1.25f;
-    float const speed = 675.0f;   // 750 * 0.9 at full throw strength
-    Vector const velocity = fwd * speed + carry;
+    Vector velocity;
+    if (cfg.super_toss) {
+        QAngle dummy;
+        ComputeSuperTossInternal(local, real_view_angles, IN_ATTACK, dummy, velocity);
+    } else {
+        Vector const carry = *reinterpret_cast<Vector*>((char*)local + off::m_vecVelocity) * 1.25f;
+        float const speed = 675.0f;   // 750 * 0.9 at full throw strength
+        velocity = fwd * speed + carry;
+    }
 
     Simulate(local, type, start, velocity);
     BlendDisplay();
@@ -312,6 +383,16 @@ void ScanLiveGrenades() {
     }
 }
 
+}
+
+bool Grenades_GetHeldThrowVelocity(void* local, const QAngle& view_ang, Vector& out_vel, float& out_speed) {
+    if (!local || HeldType(local) == NADE_NONE) return false;
+    QAngle cmd_ang;
+    ComputeSuperTossInternal(local, view_ang, (int)out_speed, cmd_ang, out_vel);
+    out_vel.x = cmd_ang.x;
+    out_vel.y = cmd_ang.y;
+    out_vel.z = cmd_ang.z;
+    return true;
 }
 
 void Grenades_Draw(ImDrawList* draw, int width, int height) {

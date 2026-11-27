@@ -1727,6 +1727,7 @@ void DrawESP(ImDrawList* draw, int width, int height) {
         }
 
         esp_layout::RenderStatic(draw, min, max, alpha, espv);
+        Lua_OnPlayerESP(draw, i, esp_info.name, health, espv.armor, team, (local && team != local_team), alive, dormant, origin, min, max, alpha);
 
         if (alive && cfg.esp_skeleton && !dormant)
             DrawSkeleton(draw, entity, i, width, height, alpha);

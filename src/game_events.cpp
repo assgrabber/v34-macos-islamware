@@ -70,6 +70,7 @@ HOOK_THISCALL(void, ListenerFire, void*, void* event) {
         int const shooter = PlayerIndexForUserID(userid);
         if (shooter > 0 && shooter <= 64)
             g_player_shot_ms[shooter] = GetTickCount64();
+        Lua_OnGameEvent(name, shooter, 0, nullptr);
         return;
     }
 
@@ -88,14 +89,16 @@ HOOK_THISCALL(void, ListenerFire, void*, void* event) {
         int const local_idx = engine.GetLocalPlayer();
         if (local_idx > 0 && shooter == local_idx)
             MissLog_OnLocalImpact(pos);
+        Lua_OnGameEvent(name, shooter, 0, &pos);
         return;
     }
 
     if (strcmp(name, "player_death") == 0) {
-        if (!cfg.kill_effects) return;
         int const local = engine.GetLocalPlayer();
         int const killer = PlayerIndexForUserID(VFunc<GetIntFn>(event, 6)(event, "attacker", 0));
         int const victim = PlayerIndexForUserID(VFunc<GetIntFn>(event, 6)(event, "userid", 0));
+        Lua_OnGameEvent(name, victim, killer, nullptr);
+        if (!cfg.kill_effects) return;
         if (local <= 0 || killer != local || victim <= 0 || victim == local) return;
 
         void* ent = entity_list.GetClientEntity(victim);

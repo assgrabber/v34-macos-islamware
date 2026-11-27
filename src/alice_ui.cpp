@@ -1372,9 +1372,9 @@ namespace
             c_ui_elements::begin_group( "VIEW", { GetContentRegionAvail( ).x, 99999.f } );
             c_ui_elements::start( "FOV override (0 = default)" ).add_slider( &cfg.fov_override, 0.0f, 160.0f, "%.0f" ).finish( );
             c_ui_elements::start( "Override viewmodel FOV" ).add_slider( &cfg.viewmodel_fov, 0.0f, 160.0f, "%.0f" ).finish( );
-            c_ui_elements::start( "Viewmodel offset X" ).add_slider( &cfg.viewmodel_x, -10.0f, 10.0f, "%.1f" ).finish( );
-            c_ui_elements::start( "Viewmodel offset Y" ).add_slider( &cfg.viewmodel_y, -10.0f, 10.0f, "%.1f" ).finish( );
-            c_ui_elements::start( "Viewmodel offset Z" ).add_slider( &cfg.viewmodel_z, -10.0f, 10.0f, "%.1f" ).finish( );
+            c_ui_elements::start( "Viewmodel offset X" ).add_slider( &cfg.viewmodel_x, -20.0f, 20.0f, "%.1f" ).finish( );
+            c_ui_elements::start( "Viewmodel offset Y" ).add_slider( &cfg.viewmodel_y, -20.0f, 20.0f, "%.1f" ).finish( );
+            c_ui_elements::start( "Viewmodel offset Z" ).add_slider( &cfg.viewmodel_z, -20.0f, 20.0f, "%.1f" ).finish( );
             bind_row_ex( "Left hand", &cfg.left_hand, FB_LEFT_HAND );
             bind_row_ex( "Remove viewmodel bob", &cfg.remove_bob, FB_REMOVE_BOB );
             c_ui_elements::end_group( );
