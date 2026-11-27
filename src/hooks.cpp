@@ -2312,7 +2312,9 @@ static HOOK_THISCALL(void, HookedBaseCreateMove, void*, int sequence_number, flo
                 s_nade_release = 0;
             } else if (s_nade_pulled) {
                 s_nade_pulled = false;
-                s_nade_release = 2;
+                // Source delays ThrowGrenade() by m_fThrowTime = curtime + 0.1f
+                // (~7 ticks at 66Hz, ~10 ticks at 100Hz) after button release.
+                s_nade_release = 12;
             }
             if (s_nade_release > 0) {
                 s_nade_release--;
