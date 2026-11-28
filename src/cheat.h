@@ -393,6 +393,7 @@ struct Config {
 
     // Scope override (killed/claret style)
     bool rem_scope = false;
+    bool no_scope_zoom = false;
     bool custom_scope = false;
     float custom_scope_color[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
     int scope_gap = 10;
@@ -406,6 +407,22 @@ struct Config {
 
     // Super Toss: compensates grenade throw angle for player velocity so it flies straight
     bool super_toss = false;
+
+    // Penetration crosshair (killed/claret style 3D/2D surface box indicator)
+    bool pen_crosshair = false;
+    int pen_crosshair_style = 0; // 0 = 3D Box, 1 = 2D Surface Box
+    bool pen_crosshair_dot = true;
+    float pen_crosshair_yes_color[4] = { 0.25f, 0.95f, 0.35f, 0.90f };
+    float pen_crosshair_no_color[4]  = { 0.95f, 0.25f, 0.25f, 0.90f };
+
+    // Fake model chams (translucent local ghost model showing fake angle in thirdperson)
+    bool chams_fake = false;
+    float chams_fake_color[4] = { 0.16f, 0.45f, 1.0f, 0.55f };
+
+    // CS:S v34 Cheat Revealer & Spoofer (friendsName / SendClientInfo)
+    bool cheat_revealer = true;
+    bool esp_cheat_tag = true;
+    int cheat_spoofer = 1; // 0=Off, 1=Islamware, 2=Epoximotion, 3=Poptape, 4=Claret, 5=Killed, 6=Neverlose, 7=Skeet, 8=Insomnia
 };
 
 extern Config cfg;
@@ -484,7 +501,9 @@ bool Backtrack_PickRecord(int index, float seconds_ago, Vector& out_origin, floa
 void Resolver_OnMiss(int index);
 void Resolver_OnHit(int index);
 int Resolver_Side(int index);
+int Resolver_Misses(int index);
 bool Resolver_IsResolved(int index);
+void Resolver_ApplyFrameStage();
 bool TargetRecentlyShot(int index, ULONGLONG window_ms = 250);
 
 // bind state query for the hotkey window (hooks.cpp)
@@ -508,6 +527,8 @@ namespace glb_preview {
 // custom miss feed
 void MissLog_Push(char const* prefix, char const* rest);
 void MissLog_OnLocalImpact(Vector const& pos);
+void MissLog_OnLocalHurt(int victim_index);
+void MissLog_Tick();
 void GetLocalEye(Vector& eye, QAngle& angles);
 CUserCmd* GetUserCmd(int sequence);
 void* GetLocalEntity();
@@ -523,11 +544,16 @@ bool TraceLine(const Vector& from, const Vector& to, float& fraction, Vector& en
 bool CanPenetrate(const Vector& from, const Vector& to, float max_thickness, void* skip = nullptr);
 bool CanPenetrateTarget(const Vector& from, const Vector& to, void* target, int hitbox,
                         float min_damage, float* out_damage = nullptr);
+bool PenetrationCrosshairCheck(const Vector& from, const QAngle& angles,
+                               Vector& out_hit, Vector& out_normal, float& out_damage);
+const char* CheatRevealer_Identify(const char* friends_name, const char* player_name,
+                                   uint32_t* out_rgba = nullptr, const char** out_short_tag = nullptr);
 float CalcHitDamage(float base_damage, float armor_ratio, float range_modifier,
                     float distance, int hitbox, void* target);
 bool GetActiveWeaponDamageInfo(int& out_damage, float& out_armor_ratio, float& out_range_modifier);
 bool TraceVisible(const Vector& from, const Vector& to, void* skip = nullptr);
 bool GetEntityBonePos(int index, int bone, Vector& out);
+bool GetEntityHeadPos(int index, int bone, Vector& out);
 
 // client-side custom player model changer (precache.cpp)
 int CustomModels_Count(bool rescan = false);

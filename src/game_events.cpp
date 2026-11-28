@@ -93,6 +93,16 @@ HOOK_THISCALL(void, ListenerFire, void*, void* event) {
         return;
     }
 
+    if (strcmp(name, "player_hurt") == 0) {
+        int const local = engine.GetLocalPlayer();
+        int const attacker = PlayerIndexForUserID(VFunc<GetIntFn>(event, 6)(event, "attacker", 0));
+        int const victim = PlayerIndexForUserID(VFunc<GetIntFn>(event, 6)(event, "userid", 0));
+        if (local > 0 && attacker == local && victim > 0 && victim <= 64 && victim != local)
+            MissLog_OnLocalHurt(victim);
+        Lua_OnGameEvent(name, victim, attacker, nullptr);
+        return;
+    }
+
     if (strcmp(name, "player_death") == 0) {
         int const local = engine.GetLocalPlayer();
         int const killer = PlayerIndexForUserID(VFunc<GetIntFn>(event, 6)(event, "attacker", 0));
@@ -148,8 +158,9 @@ void InstallGameEvents() {
     bool const ok_death = VFunc<AddListenerFn>(mgr, 3)(mgr, &g_listener, "player_death", false);
     bool const registered_death = VFunc<FindListenerFn>(mgr, 4)(mgr, &g_listener, "player_death");
     bool const ok_fire = VFunc<AddListenerFn>(mgr, 3)(mgr, &g_listener, "weapon_fire", false);
-    Log("[events] bullet_impact listener add=%d verified=%d, player_death add=%d verified=%d, weapon_fire=%d",
-        (int)ok, (int)registered, (int)ok_death, (int)registered_death, (int)ok_fire);
+    bool const ok_hurt = VFunc<AddListenerFn>(mgr, 3)(mgr, &g_listener, "player_hurt", false);
+    Log("[events] bullet_impact=%d(%d) player_death=%d(%d) weapon_fire=%d player_hurt=%d",
+        (int)ok, (int)registered, (int)ok_death, (int)registered_death, (int)ok_fire, (int)ok_hurt);
 }
 
 bool TargetRecentlyShot(int index, ULONGLONG window_ms) {

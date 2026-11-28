@@ -851,6 +851,7 @@ namespace
                     c_ui_elements::start( "Box outline" ).add_color( reinterpret_cast< ImVec4* >( cfg.esp_box_outline ) ).finish( );
                 } );
                 bind_row_ex( "Name", &cfg.esp_name, FB_ESP_NAME, reinterpret_cast< ImVec4* >( cfg.esp_name_color ) );
+                c_ui_elements::start( "Cheat tag" ).add_toggle( &cfg.esp_cheat_tag ).finish( );
                 bind_row_ex( "Armor", &cfg.esp_armor, FB_ESP_ARMOR,
                              reinterpret_cast< ImVec4* >( cfg.esp_armor_min ),
                              reinterpret_cast< ImVec4* >( cfg.esp_armor_max ) );
@@ -1252,6 +1253,13 @@ namespace
             layer_group( "VISIBLE", target->visible );
             layer_group( "OVERLAY", target->overlay );
 
+            c_ui_elements::begin_group( "FAKE MODEL CHAMS", { GetContentRegionAvail( ).x, 99999.f } );
+            c_ui_elements::start( "Fake model chams" ).add_toggle( &cfg.chams_fake ).finish( );
+            c_ui_elements::visible_if( "fake_chams_opts", cfg.chams_fake, [ & ] {
+                c_ui_elements::start( "Color" ).add_color( reinterpret_cast< ImVec4* >( cfg.chams_fake_color ) ).finish( );
+            } );
+            c_ui_elements::end_group( );
+
             c_ui_elements::begin_group( "HIT CHAMS", { GetContentRegionAvail( ).x, 99999.f } );
             bind_row( "Enabled", &cfg.chams_hit, &cfg.kb_hitchams, &cfg.kb_mode_hitchams );
             c_ui_elements::visible_if( "hit_chams_opts", cfg.chams_hit, [ & ] {
@@ -1371,6 +1379,7 @@ namespace
         {
             c_ui_elements::begin_group( "VIEW", { GetContentRegionAvail( ).x, 99999.f } );
             c_ui_elements::start( "FOV override (0 = default)" ).add_slider( &cfg.fov_override, 0.0f, 160.0f, "%.0f" ).finish( );
+            c_ui_elements::start( "No scope zoom" ).add_toggle( &cfg.no_scope_zoom ).finish( );
             c_ui_elements::start( "Override viewmodel FOV" ).add_slider( &cfg.viewmodel_fov, 0.0f, 160.0f, "%.0f" ).finish( );
             c_ui_elements::start( "Viewmodel offset X" ).add_slider( &cfg.viewmodel_x, -20.0f, 20.0f, "%.1f" ).finish( );
             c_ui_elements::start( "Viewmodel offset Y" ).add_slider( &cfg.viewmodel_y, -20.0f, 20.0f, "%.1f" ).finish( );
@@ -1415,6 +1424,15 @@ namespace
             c_ui_elements::begin_group( "OVERLAYS", { GetContentRegionAvail( ).x, 99999.f } );
             c_ui_elements::start( "Watermark" ).add_toggle( &cfg.watermark ).finish( );
             c_ui_elements::start( "Aim FOV circle" ).add_toggle( &cfg.draw_aim_fov ).finish( );
+            c_ui_elements::start( "Penetration crosshair" ).add_toggle( &cfg.pen_crosshair ).finish( );
+            c_ui_elements::visible_if( "pen_xhair_opts", cfg.pen_crosshair, [ & ] {
+                static std::vector< std::string > pen_styles = { "3D Box", "2D Surface Box" };
+                c_ui_elements::start( "Box style" ).add_dropdown( &cfg.pen_crosshair_style, pen_styles ).finish( );
+                c_ui_elements::start( "Penetration dot" ).add_toggle( &cfg.pen_crosshair_dot ).finish( );
+            } );
+            c_ui_elements::start( "Cheat revealer (TAB)" ).add_toggle( &cfg.cheat_revealer ).finish( );
+            static std::vector< std::string > spoof_list = { "Off", "Islamware", "Epoximotion", "Poptape", "Claret", "Killed", "Neverlose", "Skeet", "Insomnia" };
+            c_ui_elements::start( "Cheat spoofer" ).add_dropdown( &cfg.cheat_spoofer, spoof_list ).finish( );
             c_ui_elements::end_group( );
         }
     };

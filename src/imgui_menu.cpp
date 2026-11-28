@@ -263,17 +263,14 @@ void MenuIslandsImpl(ImDrawList* draw, int width, int height) {
     float island_h = 0.f;
     if (cfg.hotkey_list || g_hk_alpha > 0.01f) {
         float x = cfg.hotkey_x, y = cfg.hotkey_y;
-        float const row_h = fs + 8.f;
-        float const pad = 10.f;       // side inset
-        float const gap_top = 6.f;    // bar to first row
-        float const gap_bottom = 6.f; // last row to window bottom (same as top)
+        float const row_h = fs + 5.f;
+        float const pad = 10.f;        // compact minimalist side inset
+        float const col_gap = 12.f;    // tight column spacing
+        float const gap_top = 5.f;
+        float const gap_bottom = 5.f;
         ImGuiIO& mio = ImGui::GetIO();
         float const ft = 1.f - std::exp(-14.f * (mio.DeltaTime > 0.f ? mio.DeltaTime : 1.f / 60.f));
 
-        // persistent per-function animation state, keyed by the bind pointer:
-        // rows fade + slide in when a function engages, fade + slide out when
-        // it releases, and their vertical slots animate like the reference
-        // keybind widget
         struct HkRow {
             int* vk;
             char label[64];
@@ -290,7 +287,6 @@ void MenuIslandsImpl(ImDrawList* draw, int width, int height) {
         BindRef snapshot[32];
         int const snap_count = SnapshotBinds(snapshot, 32);
 
-        // display labels get their "##id" suffix stripped
         auto visible_label = [](char const* label) {
             static char buf[64];
             char const* cut = strstr(label, "##");
@@ -328,15 +324,17 @@ void MenuIslandsImpl(ImDrawList* draw, int width, int height) {
             r->mode_w = cfg.hotkey_show_mode ? ImGui::CalcTextSize(r->modestr).x : 0.f;
             r->vk = b.vk;
             r->present = true;
-            r->y = (float)slot * (row_h + 4.f);
+            r->y = (float)slot * row_h;
             slot++;
         }
 
         bool const visible = cfg.menu_open ? cfg.hotkey_list : (cfg.hotkey_list && any_active);
 
-        // animate every row
+        // Align columns vertically across all active rows (Name | Mode | Key)
         float content_bottom = 0.f;
-        float target_w = pad + ImGui::CalcTextSize("Hotkeys").x + pad;
+        float max_name_w = ImGui::CalcTextSize("Hotkeys").x;
+        float max_mode_w = 0.f;
+        float max_key_w = 0.f;
         for (int i = 0; i < 32; i++) {
             HkRow& r = g_hk_rows[i];
             if (!r.vk) continue;
@@ -344,25 +342,31 @@ void MenuIslandsImpl(ImDrawList* draw, int width, int height) {
             r.slide = ImLerp(r.slide, r.present ? 1.f : 0.f, ft);
             if (r.alpha <= 0.01f && !r.present) { r.vk = nullptr; continue; }
             if (r.present) {
-                float const end = pad + r.name_w + pad + r.key_w + ((r.key_w && r.mode_w) ? 8.f : 0.f) + r.mode_w;
-                target_w = std::max(target_w, end);
+                max_name_w = std::max(max_name_w, r.name_w);
+                max_mode_w = std::max(max_mode_w, r.mode_w);
+                max_key_w = std::max(max_key_w, r.key_w);
                 content_bottom = std::max(content_bottom, r.y + row_h);
             }
         }
+
+        float target_w = pad + max_name_w;
+        if (max_mode_w > 0.f) target_w += col_gap + max_mode_w;
+        if (max_key_w > 0.f)  target_w += col_gap + max_key_w;
+        target_w += pad;
+        if (target_w < 110.f) target_w = 110.f;
 
         float const g_hk_alpha_target = visible ? 1.f : 0.f;
         g_hk_alpha = ImLerp(g_hk_alpha, g_hk_alpha_target, ft);
 
         if (g_hk_alpha > 0.01f) {
             float const title_h = fs + 10.f;
-            // the frame animates with the rows instead of snapping
             static float anim_w = 0.f;
             static float anim_h = 0.f;
-            anim_w = ImLerp(anim_w, target_w + pad, ft);
-            float const target_h = title_h + gap_top + content_bottom + gap_bottom;
+            anim_w = ImLerp(anim_w, target_w, ft);
+            float const target_h = title_h + (content_bottom > 0.f ? (gap_top + content_bottom + gap_bottom) : 6.f);
             anim_h = ImLerp(anim_h, target_h, ft);
-            if (anim_w < 40.f) anim_w = 40.f;
-            if (anim_h < title_h + 8.f) anim_h = title_h + 8.f;
+            if (anim_w < 96.f) anim_w = 96.f;
+            if (anim_h < title_h + 6.f) anim_h = title_h + 6.f;
             float const win_w = anim_w;
             float const win_h = anim_h;
 
@@ -371,7 +375,6 @@ void MenuIslandsImpl(ImDrawList* draw, int width, int height) {
                 return (col & ~IM_COL32_A_MASK) | (av << IM_COL32_A_SHIFT);
             };
 
-            // drag: the whole top bar, unclipped (islands draw outside any window)
             static bool dragging = false;
             static ImVec2 grab{};
             if (cfg.menu_open &&
@@ -389,30 +392,36 @@ void MenuIslandsImpl(ImDrawList* draw, int width, int height) {
             if (!ImGui::IsMouseDown(0))
                 dragging = false;
 
-            draw->AddRectFilled(ImVec2(x, y), ImVec2(x + win_w, y + win_h), fade(g_hk_alpha, IM_COL32(1, 1, 1, 225)), 6.f);
-            draw->AddRect(ImVec2(x, y), ImVec2(x + win_w, y + win_h), fade(g_hk_alpha, IM_COL32(0, 0, 0, 140)), 6.f);
-            draw->AddRectFilled(ImVec2(x, y), ImVec2(x + win_w, y + title_h), fade(g_hk_alpha, IM_COL32(16, 17, 20, 240)), 6.f,
+            float const rounding = 8.f;
+            // Minimalistic dark body (#0E0E10) + pure black top bar (#000000), no borders/accent lines
+            draw->AddRectFilled(ImVec2(x, y), ImVec2(x + win_w, y + win_h),
+                                fade(g_hk_alpha, IM_COL32(14, 14, 16, 245)), rounding);
+            draw->AddRectFilled(ImVec2(x, y), ImVec2(x + win_w, y + title_h),
+                                fade(g_hk_alpha, IM_COL32(0, 0, 0, 250)), rounding,
                                 ImDrawFlags_RoundCornersTop);
-            draw->AddLine(ImVec2(x, y + title_h), ImVec2(x + win_w, y + title_h), fade(g_hk_alpha, IM_COL32(60, 62, 70, 200)), 1.f);
-            draw->AddText(ImVec2(x + 8.f, y + (title_h - fs) * 0.5f), fade(g_hk_alpha, IM_COL32(235, 235, 240, 255)), "Hotkeys");
+            draw->AddText(ImVec2(x + pad, y + (title_h - fs) * 0.5f),
+                          fade(g_hk_alpha, IM_COL32(244, 244, 248, 255)), "Hotkeys");
 
             float const rows_top = y + title_h + gap_top;
+            float const col_mode_x = x + pad + max_name_w + col_gap;
+            float const col_key_x  = col_mode_x + (max_mode_w > 0.f ? (max_mode_w + col_gap) : 0.f);
             for (int i = 0; i < 32; i++) {
                 HkRow const& r = g_hk_rows[i];
                 if (!r.vk || r.alpha <= 0.01f) continue;
                 float const a = g_hk_alpha * r.alpha;
-                float const slide_off = (1.f - r.slide) * 10.f;
-                float const ry = rows_top + r.y;
-                draw->AddText(ImVec2(x + pad - slide_off, ry), fade(a, IM_COL32(235, 235, 240, 255)), r.label);
-                float rx = x + pad - slide_off + r.name_w + pad;
-                if (r.key_w) {
-                    draw->AddText(ImVec2(rx, ry), fade(a, IM_COL32(66, 150, 250, 230)), r.keystr);
-                    rx += r.key_w;
-                    if (r.mode_w)
-                        rx += 8.f;
-                }
-                if (r.mode_w)
-                    draw->AddText(ImVec2(rx, ry), fade(a, IM_COL32(150, 150, 160, 220)), r.modestr);
+                float const slide_off = (1.f - r.slide) * 8.f;
+                float const ry = rows_top + r.y + (row_h - fs) * 0.5f;
+                // Column 1: Feature name (crisp white)
+                draw->AddText(ImVec2(x + pad - slide_off, ry),
+                              fade(a, IM_COL32(240, 240, 245, 255)), r.label);
+                // Column 2: Mode (crisp white)
+                if (r.mode_w > 0.f)
+                    draw->AddText(ImVec2(col_mode_x - slide_off, ry),
+                                  fade(a, IM_COL32(236, 236, 242, 255)), r.modestr);
+                // Column 3: Keybind (muted gray)
+                if (r.key_w > 0.f)
+                    draw->AddText(ImVec2(col_key_x - slide_off, ry),
+                                  fade(a, IM_COL32(132, 132, 138, 255)), r.keystr);
             }
 
             island_h = win_h;
@@ -805,6 +814,7 @@ static void RenderPlayers() {
         Check("Team check", &cfg.esp_team_check, "Players");
         Row("Box", &cfg.esp_box, cfg.esp_box_color, cfg.esp_box_outline);
         Row("Name", &cfg.esp_name, cfg.esp_name_color);
+        Check("Cheat tag##esp", &cfg.esp_cheat_tag, "ESP");
         BindPopup("Name", "Players", nullptr, nullptr);
         Row("Health", &cfg.esp_health, cfg.esp_health_min, cfg.esp_health_max);
         ImGui::BeginDisabled(!cfg.esp_health);
@@ -960,6 +970,9 @@ static void RenderModels() {
         layer("Visible", t->visible);
         layer("Overlay", t->overlay);
 
+        ImGui::SeparatorText("Fake model chams");
+        Row("Fake model chams", &cfg.chams_fake, cfg.chams_fake_color);
+
         ImGui::SeparatorText("Hit chams");
         Check("Enabled##hit", &cfg.chams_hit, "Models");
         ImGui::BeginDisabled(!cfg.chams_hit);
@@ -1064,6 +1077,16 @@ static void RenderWorld() {
 
         group("Scope");
         Check("Remove scope overlay", &cfg.rem_scope, "World");
+        Check("No scope zoom", &cfg.no_scope_zoom, "World");
+        Check("Penetration crosshair", &cfg.pen_crosshair, "World");
+        ImGui::SameLine(0.f, 8.f);
+        ImGui::ColorEdit4("##pen_yes", cfg.pen_crosshair_yes_color, ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_AlphaBar);
+        ImGui::SameLine(0.f, 4.f);
+        ImGui::ColorEdit4("##pen_no", cfg.pen_crosshair_no_color, ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_AlphaBar);
+        if (cfg.pen_crosshair) {
+            ImGui::Combo("Box style##pen", &cfg.pen_crosshair_style, "3D Box\0002D Surface Box\000");
+            Check("Penetration dot", &cfg.pen_crosshair_dot, "World");
+        }
         ImGui::BeginDisabled(!cfg.rem_scope);
         Row("Custom scope lines", &cfg.custom_scope, cfg.custom_scope_color);
         ImGui::BeginDisabled(!cfg.custom_scope);
@@ -1167,6 +1190,9 @@ static void RenderMisc() {
         group("Misc");
         Check("Watermark", &cfg.watermark, "Misc");
         Check("Super toss", &cfg.super_toss, "Misc");
+        Check("Cheat revealer (TAB)", &cfg.cheat_revealer, "Misc");
+        static const char* kSpoofNames[] = { "Off", "Islamware", "Epoximotion", "Poptape", "Claret", "Killed", "Neverlose", "Skeet", "Insomnia" };
+        ImGui::Combo("Cheat spoofer", &cfg.cheat_spoofer, kSpoofNames, 9);
         Row("Log misses##misc", &cfg.log_misses, cfg.log_misses_color);
     },
     [] {

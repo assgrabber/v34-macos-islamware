@@ -248,6 +248,10 @@ static int g_miss_hc = 100;
 static Vector g_miss_aimpoint;
 static bool g_miss_pending = false;
 static ULONGLONG g_miss_pending_time = 0;
+static bool g_miss_hurt_confirmed = false;
+static bool g_miss_impact_seen = false;
+static Vector g_miss_impact_pos;
+static ULONGLONG g_miss_impact_time = 0;
 
 void MissLog_ArmShot(char const* name, char const* hitbox, int hc, Vector const& aimpoint) {
     strncpy(g_miss_target, name ? name : "?", sizeof(g_miss_target) - 1);
@@ -255,31 +259,64 @@ void MissLog_ArmShot(char const* name, char const* hitbox, int hc, Vector const&
     g_miss_hc = hc;
     g_miss_aimpoint = aimpoint;
     g_miss_pending = true;
+    g_miss_hurt_confirmed = false;
+    g_miss_impact_seen = false;
     g_miss_pending_time = GetTickCount64();
+}
+
+void MissLog_OnLocalHurt(int victim_index) {
+    if (victim_index <= 0 || victim_index > 64) return;
+    Resolver_OnHit(victim_index);
+    if (g_miss_pending && (g_miss_target_idx == victim_index || g_miss_target_idx <= 0)) {
+        g_miss_hurt_confirmed = true;
+        g_miss_pending = false;
+    }
 }
 
 void MissLog_OnLocalImpact(Vector const& pos) {
     if (!g_miss_pending) return;
-    g_miss_pending = false;
-    if (GetTickCount64() - g_miss_pending_time > 1000)
-        return; // impact from an older shot
-    float const dx = pos.x - g_miss_aimpoint.x;
-    float const dy = pos.y - g_miss_aimpoint.y;
-    float const dz = pos.z - g_miss_aimpoint.z;
-    float const off = sqrtf(dx * dx + dy * dy + dz * dz);
-    if (off <= 20.0f)
-        Resolver_OnHit(g_miss_target_idx);
-    else
-        Resolver_OnMiss(g_miss_target_idx);
-    // the server impact is far off the aimed hitbox - the shot missed
-    if (off > 20.0f) {
-        char rest[160];
-        snprintf(rest, sizeof(rest), "spread at %s (%s, hc %d%%)",
-                 g_miss_target, g_miss_hitbox, g_miss_hc);
-        MissLog_Push("Missed shot due to ", rest);
-        if (cfg.log_misses)
-            Log("[miss] %s%s (%.1f units off)", "Missed shot due to ", rest, off);
+    if (GetTickCount64() - g_miss_pending_time > 1000) {
+        g_miss_pending = false;
+        return;
     }
+    g_miss_impact_pos = pos;
+    g_miss_impact_seen = true;
+    g_miss_impact_time = GetTickCount64();
+}
+
+void MissLog_Tick() {
+    if (!g_miss_pending) return;
+    ULONGLONG const now = GetTickCount64();
+    // Wait briefly after bullet_impact (60ms) or shot (160ms) so server player_hurt
+    // arrives first; if no player_hurt fired, this shot is a confirmed server miss.
+    bool const ready = (g_miss_impact_seen && (now - g_miss_impact_time) >= 60) ||
+                       ((now - g_miss_pending_time) >= 160);
+    if (!ready) return;
+
+    g_miss_pending = false;
+    if (g_miss_hurt_confirmed) return;
+
+    float off = 0.0f;
+    if (g_miss_impact_seen) {
+        float const dx = g_miss_impact_pos.x - g_miss_aimpoint.x;
+        float const dy = g_miss_impact_pos.y - g_miss_aimpoint.y;
+        float const dz = g_miss_impact_pos.z - g_miss_aimpoint.z;
+        off = sqrtf(dx * dx + dy * dy + dz * dz);
+    }
+
+    // Bullet went straight to aimed point (or NoSpread active) with no player_hurt ->
+    // missed due to fake model / anti-aim -> advance resolver angle!
+    bool const resolver_miss = !g_miss_impact_seen || off <= 24.0f || cfg.nospread;
+    if (resolver_miss)
+        Resolver_OnMiss(g_miss_target_idx);
+
+    char rest[160];
+    snprintf(rest, sizeof(rest), "%s at %s (%s, hc %d%%)",
+             resolver_miss ? "resolver" : "spread",
+             g_miss_target, g_miss_hitbox, g_miss_hc);
+    MissLog_Push("Missed shot due to ", rest);
+    if (cfg.log_misses)
+        Log("[miss] Missed shot due to %s (%.1f units off)", rest, off);
 }
 
 // knifebot swing: the angle is also applied to the outgoing command in
@@ -287,6 +324,22 @@ void MissLog_OnLocalImpact(Vector const& pos) {
 static QAngle g_knife_angle;
 static DWORD g_knife_time = 0;
 static bool g_knife_swing = false;
+
+static bool StrContainsICase(const char* hay, const char* needle) {
+    if (!hay || !needle || !needle[0]) return false;
+    for (const char* h = hay; *h; ++h) {
+        const char* a = h;
+        const char* b = needle;
+        while (*a && *b) {
+            char ca = (*a >= 'A' && *a <= 'Z') ? (char)(*a + 32) : *a;
+            char cb = (*b >= 'A' && *b <= 'Z') ? (char)(*b + 32) : *b;
+            if (ca != cb) break;
+            ++a; ++b;
+        }
+        if (!*b) return true;
+    }
+    return false;
+}
 
 static int CurrentWeaponGroup( ) {
     void* local = GetLocalEntity( );
@@ -304,13 +357,13 @@ static int CurrentWeaponGroup( ) {
     char const* cls = ClientClassName(cc);
     int g = 0;
     if ( cls ) {
-        if ( strstr( cls, "Knife" ) ) g = 6;
-        else if ( strstr( cls, "AWP" ) || strstr( cls, "Scout" ) || strstr( cls, "SG550" ) || strstr( cls, "G3SG1" ) ) g = 1;
-        else if ( strstr( cls, "Glock" ) || strstr( cls, "USP" ) || strstr( cls, "Deagle" ) || strstr( cls, "P228" ) ||
-                  strstr( cls, "FiveSeven" ) || strstr( cls, "Elite" ) ) g = 2;
-        else if ( strstr( cls, "MAC10" ) || strstr( cls, "MP5" ) || strstr( cls, "TMP" ) || strstr( cls, "UMP45" ) || strstr( cls, "P90" ) ) g = 3;
-        else if ( strstr( cls, "M3" ) || strstr( cls, "XM1014" ) ) g = 4;
-        else if ( strstr( cls, "M249" ) || strstr( cls, "Negev" ) ) g = 5;
+        if ( StrContainsICase( cls, "knife" ) ) g = 6;
+        else if ( StrContainsICase( cls, "awp" ) || StrContainsICase( cls, "scout" ) || StrContainsICase( cls, "sg550" ) || StrContainsICase( cls, "g3sg1" ) ) g = 1;
+        else if ( StrContainsICase( cls, "glock" ) || StrContainsICase( cls, "usp" ) || StrContainsICase( cls, "deagle" ) || StrContainsICase( cls, "p228" ) ||
+                  StrContainsICase( cls, "fiveseven" ) || StrContainsICase( cls, "elite" ) ) g = 2;
+        else if ( StrContainsICase( cls, "mac10" ) || StrContainsICase( cls, "mp5" ) || StrContainsICase( cls, "tmp" ) || StrContainsICase( cls, "ump45" ) || StrContainsICase( cls, "p90" ) ) g = 3;
+        else if ( StrContainsICase( cls, "m3" ) || StrContainsICase( cls, "xm1014" ) ) g = 4;
+        else if ( StrContainsICase( cls, "m249" ) || StrContainsICase( cls, "negev" ) ) g = 5;
         else g = 0;
     }
     cached_group = g;
@@ -579,10 +632,12 @@ static float WeaponGetSpread(void* weapon) {
         if (!on_ground) return 0.04f + 0.4f * acc;
         if (speed > 140.0f) return 0.04f + 0.07f * acc;
         return 0.0275f * acc;
-    case 21: // M4A1 (unsilenced)
-        if (!on_ground) return 0.035f + 0.4f * acc;
+    case 21: { // M4A1
+        bool const sil = *reinterpret_cast<const bool*>((const char*)weapon + 0x780);
+        if (!on_ground) return (sil ? 0.035f : 0.035f) + 0.4f * acc;
         if (speed > 140.0f) return 0.035f + 0.07f * acc;
-        return 0.02f * acc;
+        return (sil ? 0.025f : 0.02f) * acc;
+    }
     case 25: // DEagle
         if (!on_ground) return 1.5f * (1.0f - acc);
         if (speed > 5.0f) return 0.25f * (1.0f - acc);
@@ -605,11 +660,13 @@ static float WeaponGetSpread(void* weapon) {
         if (speed > 5.0f) return 0.15f;
         if (ducking) return (zoomed ? 0.0f : 0.025f) + 0.04f * (1.0f - acc);
         return (zoomed ? 0.0f : 0.025f) + 0.05f * (1.0f - acc);
-    case 16: // USP
-        if (!on_ground) return 1.2f * (1.0f - acc);
-        if (speed > 5.0f) return 0.225f * (1.0f - acc);
-        if (ducking) return 0.08f * (1.0f - acc);
-        return 0.1f * (1.0f - acc);
+    case 16: { // USP
+        bool const sil = *reinterpret_cast<const bool*>((const char*)weapon + 0x778);
+        if (!on_ground) return (sil ? 1.3f : 1.2f) * (1.0f - acc);
+        if (speed > 5.0f) return (sil ? 0.25f : 0.225f) * (1.0f - acc);
+        if (ducking) return (sil ? 0.10f : 0.08f) * (1.0f - acc);
+        return (sil ? 0.15f : 0.1f) * (1.0f - acc);
+    }
     case 2: // Glock
         if (!on_ground) return 1.0f * (1.0f - acc);
         if (speed > 5.0f) return 0.165f * (1.0f - acc);
@@ -674,7 +731,10 @@ static bool WeaponCanFire(void* local) {
     int const clip = *reinterpret_cast<int*>((char*)weapon + off::w_iClip1);
     if (clip == 0) return false;
     int const tick_base = *reinterpret_cast<int*>((char*)local + off::m_nTickBase);
-    float const server_time = (float)tick_base * GetIntervalPerTick();
+    // Client tick_base advances by +1 inside server PhysicsSimulate for this cmd.
+    float const server_time = (float)(tick_base + 1) * GetIntervalPerTick();
+    float const player_next = *reinterpret_cast<float*>((char*)local + off::m_flNextAttack);
+    if (player_next > server_time + 1e-4f) return false;
     float const next_attack = *reinterpret_cast<float*>((char*)weapon + off::w_flNextPrimaryAttack);
     return next_attack <= server_time + 1e-4f;
 }
@@ -685,7 +745,8 @@ static float ComputeHitChance(void* weapon, float dist, int hitbox) {
     float const spread = WeaponGetSpread(weapon);
     if (inacc + spread <= 1e-6f) return 100.0f;
 
-    float const radius = (hitbox <= 1) ? 3.2f : 6.0f;
+    // Real CS:S hitbox radii (~4.2u head, ~3.8u neck, ~7.0u torso)
+    float const radius = (hitbox == 0) ? 4.2f : (hitbox == 1 ? 3.8f : 7.0f);
     float const max_tan = radius / (dist > 1.0f ? dist : 1.0f);
     float const max_tan2 = max_tan * max_tan;
     float const two_pi = 6.283185307179586f;
@@ -715,8 +776,9 @@ static float ComputeHitChance(void* weapon, float dist, int hitbox) {
     return ((float)hits / 32.0f) * 100.0f;
 }
 
-static bool FindSilentTarget(const Vector& eye, const QAngle& camera, QAngle& out, int& out_tick_count, bool allow_wall = true) {
+static bool FindSilentTarget(const Vector& eye, const QAngle& camera, QAngle& out, int& out_tick_count, bool allow_wall = true, bool* out_can_shoot = nullptr) {
     out_tick_count = 0;
+    if (out_can_shoot) *out_can_shoot = false;
     void* local = GetLocalEntity();
     if (!local) return false;
 
@@ -742,6 +804,11 @@ static bool FindSilentTarget(const Vector& eye, const QAngle& camera, QAngle& ou
         if (health <= 0) continue;
         if (*reinterpret_cast<int*>((char*)ent + off::m_iTeamNum) == local_team) continue;
         if (IsWhitelisted(i)) continue;
+
+        Vector const ent_org = *reinterpret_cast<Vector*>((char*)ent + off::m_vecOrigin);
+        if (!(ent_org.x == ent_org.x) || !(ent_org.y == ent_org.y) || !(ent_org.z == ent_org.z) ||
+            fabsf(ent_org.x) > 32768.0f || fabsf(ent_org.y) > 32768.0f || fabsf(ent_org.z) > 32768.0f)
+            continue;
 
         Vector const pe = PlayerEye(ent);
         QAngle const a = CalcAngle(eye, pe);
@@ -784,15 +851,20 @@ static bool FindSilentTarget(const Vector& eye, const QAngle& camera, QAngle& ou
     int vis_rank = -1, wall_rank = -1;
     Vector vis_target, wall_target;
     int vis_hb = -1, wall_hb = -1;
+    float vis_best_dmg = -1.0f, wall_best_dmg = -1.0f;
     int vis_hc_rank = -1, wall_hc_rank = -1;
     Vector vis_hc_target, wall_hc_target;
     int vis_hc_hb = -1, wall_hc_hb = -1;
+    float vis_hc_best_dmg = -1.0f, wall_hc_best_dmg = -1.0f;
 
     void* const local_wpn = GetActiveWeapon(local);
     int wpn_base_dmg = 0;
     float wpn_armor_ratio = 1.0f, wpn_range_mod = 0.98f;
     bool const have_wpn_dmg = GetActiveWeaponDamageInfo(wpn_base_dmg, wpn_armor_ratio, wpn_range_mod);
     bool const baim_bind_on = cfg.baim_force && BindActive(cfg.kb_baim, cfg.kb_mode_baim, BIND_BAIM);
+
+    int wall_traces = 0;
+    constexpr int kMaxWallTracesPerTick = 12;
 
     for (int c = 0; c < count && vis_hc_rank < 0; c++) {
         void* ent = cands[c].ent;
@@ -827,13 +899,16 @@ static bool FindSilentTarget(const Vector& eye, const QAngle& camera, QAngle& ou
         bool const body_disabled = (cfg.baim_dis_shooting && target_shooting) ||
                                    (cfg.baim_dis_resolved && target_resolved);
 
-        bool const force_cond = baim_bind_on || cfg.body_aim == 2 ||
+        bool const hard_baim = (baim_bind_on || cfg.body_aim == 2) && !body_disabled;
+        bool const force_cond = hard_baim ||
                                 (cfg.baim_lethal && is_lethal_body) ||
                                 (cfg.baim_in_air && is_air) ||
                                 (cfg.baim_moving && is_moving) ||
                                 (cfg.baim_on_peek && is_peeking);
         bool const force_baim = force_cond && !body_disabled;
-        bool const prefer_baim = (cfg.body_aim == 1) && !body_disabled;
+        // Auto-baim fallback after 2+ misses on an unresolvable fake model
+        bool const miss_baim = cfg.resolver && Resolver_Misses(ei) >= 2 && !body_disabled;
+        bool const prefer_baim = ((cfg.body_aim == 1) && !body_disabled) || miss_baim;
 
         // Build hitbox scan order (0=head, 1=neck, 2=chest, 3=stomach, 4=pelvis)
         int scan_order[5];
@@ -843,8 +918,9 @@ static bool FindSilentTarget(const Vector& eye, const QAngle& camera, QAngle& ou
             scan_order[scan_n++] = pref;
             for (int b = 2; b <= 4; b++)
                 if (b != pref) scan_order[scan_n++] = b;
-            // Under forced baim, only allow head/neck as fallback if disablers permit
-            if (!force_baim || cfg.baim_dis_low_dmg || cfg.baim_dis_head_safe) {
+            // Always allow head/neck fallback when no body hitbox is hittable, unless
+            // explicit hard baim (keybind / body_aim==2) is active without disablers.
+            if (!hard_baim || cfg.baim_dis_low_dmg || cfg.baim_dis_head_safe) {
                 scan_order[scan_n++] = 0;
                 scan_order[scan_n++] = 1;
             }
@@ -857,8 +933,9 @@ static bool FindSilentTarget(const Vector& eye, const QAngle& camera, QAngle& ou
             int const hb = scan_order[si];
             if (any_hb && !aim.hb[hb]) continue;
 
-            // Under force_baim, only allow head/neck when a body disabler fires
-            if (force_baim && hb < 2) {
+            // Under explicit hard_baim, only allow head/neck when a body disabler fires;
+            // soft baim conditions (moving/on_peek/in_air/lethal) always fall back to head if body isn't hittable.
+            if (hard_baim && hb < 2) {
                 bool const allow_head_fallback =
                     (cfg.baim_dis_low_dmg && !any_body_hit) ||
                     (cfg.baim_dis_head_safe && !any_body_hit);
@@ -866,24 +943,28 @@ static bool FindSilentTarget(const Vector& eye, const QAngle& camera, QAngle& ou
             }
 
             Vector center;
-            if (hb_bones[hb] >= 0 && GetEntityBonePos(ei, hb_bones[hb], center)) {
-                // Head1 sits at the jaw/neck attachment; +3.5z centers on the head hitbox
-                if (hb == 0) center.z += 3.5f;
+            if (hb == 0 && hb_bones[0] >= 0 && GetEntityHeadPos(ei, hb_bones[0], center)) {
+                // exact bone-oriented head hitbox center
+            } else if (hb_bones[hb] >= 0 && GetEntityBonePos(ei, hb_bones[hb], center)) {
+                // bone center
             } else {
                 center = origin + Vector(0.0f, 0.0f, vo.z * heights[hb]);
             }
 
             // Build multipoint list (center always first)
-            Vector pts[3];
+            Vector pts[5];
             int pt_n = 1;
             pts[0] = center;
-            float const mp_side = (hb == 0) ? 2.2f : ((hb == 2 || hb == 3) ? 4.0f : 0.0f);
+            float const mp_side = (hb == 0) ? 2.2f : ((hb == 2 || hb == 3) ? 4.5f : (hb == 4 ? 3.5f : 0.0f));
             if (mp_side > 0.0f) {
                 Vector fwd, right, up;
                 AngleVectors(CalcAngle(eye, center), fwd, right, up);
-                pts[1] = center + right * mp_side;
-                pts[2] = center - right * mp_side;
-                pt_n = 3;
+                pts[pt_n++] = center + right * mp_side;
+                pts[pt_n++] = center - right * mp_side;
+                if (hb == 0) {
+                    pts[pt_n++] = center + up * 2.6f;
+                    pts[pt_n++] = center - up * 1.4f;
+                }
             }
 
             for (int pi = 0; pi < pt_n; pi++) {
@@ -899,41 +980,63 @@ static bool FindSilentTarget(const Vector& eye, const QAngle& camera, QAngle& ou
                                        (ComputeHitChance(local_wpn, dist, hb) >= aim.hit_chance);
 
                 if (TraceVisible(eye, target, ent)) {
+                    float dmg = have_wpn_dmg
+                        ? CalcHitDamage((float)wpn_base_dmg, wpn_armor_ratio, wpn_range_mod, dist, hb, ent)
+                        : 50.0f;
                     if (aim.min_damage > 0.0f && have_wpn_dmg) {
-                        float const dmg = CalcHitDamage((float)wpn_base_dmg, wpn_armor_ratio, wpn_range_mod, dist, hb, ent);
                         float const req = aim.min_damage > (float)hp ? (float)hp : aim.min_damage;
                         if (dmg < req) continue;
                     }
                     if (hb >= 2) any_body_hit = true;
-                    if (vis_rank < 0) {
+                    // Prefer lethal/highest damage on same candidate, or first higher-priority candidate
+                    if (vis_rank < 0 || (vis_rank == c && dmg > vis_best_dmg + 5.0f)) {
                         vis_rank = c;
                         vis_target = target;
                         vis_hb = hb;
+                        vis_best_dmg = dmg;
                     }
-                    if (passes_hc) {
+                    if (passes_hc && (vis_hc_rank < 0 || (vis_hc_rank == c && dmg > vis_hc_best_dmg + 5.0f))) {
                         vis_hc_rank = c;
                         vis_hc_target = target;
                         vis_hc_hb = hb;
-                        break;
+                        vis_hc_best_dmg = dmg;
+                        if (dmg >= (float)hp || hb == 0)
+                            break;
                     }
-                } else if (allow_wall_trace && (wall_hc_rank < 0 || wall_rank < 0)) {
-#ifndef _WIN64
-                    if (pi > 0) continue;
-#endif
+                } else if (allow_wall_trace && vis_hc_rank < 0 && c < 4 && wall_traces < kMaxWallTracesPerTick) {
+                    // Check center on top 4 enemies, and side multipoints (pi <= 2) on top 2 for head/chest
+                    if (pi > 2) continue;
+                    if (pi > 0 && (c >= 2 || (hb != 0 && hb != 2))) continue;
+                    wall_traces++;
                     float const req = (aim.min_damage > 0.0f)
                         ? (aim.min_damage > (float)hp ? (float)hp : aim.min_damage)
                         : 1.0f;
-                    if (CanPenetrateTarget(eye, target, ent, hb, req)) {
+                    float wdmg = 0.0f;
+                    if (CanPenetrateTarget(eye, target, ent, hb, req, &wdmg)) {
                         if (hb >= 2) any_body_hit = true;
-                        if (wall_rank < 0) {
+                        bool const better_w = (wall_rank < 0) ||
+                            (wdmg >= (float)hp && wall_best_dmg < (float)hp) ||
+                            (wdmg > wall_best_dmg + 5.0f);
+                        if (better_w) {
                             wall_rank = c;
                             wall_target = target;
                             wall_hb = hb;
+                            wall_best_dmg = wdmg;
                         }
-                        if (passes_hc && wall_hc_rank < 0) {
-                            wall_hc_rank = c;
-                            wall_hc_target = target;
-                            wall_hc_hb = hb;
+                        if (passes_hc) {
+                            bool const better_whc = (wall_hc_rank < 0) ||
+                                (wdmg >= (float)hp && wall_hc_best_dmg < (float)hp) ||
+                                (wdmg > wall_hc_best_dmg + 5.0f);
+                            if (better_whc) {
+                                wall_hc_rank = c;
+                                wall_hc_target = target;
+                                wall_hc_hb = hb;
+                                wall_hc_best_dmg = wdmg;
+                                if (wdmg >= (float)hp || hb == 0) {
+                                    wall_traces = kMaxWallTracesPerTick;
+                                    break;
+                                }
+                            }
                         }
                     }
                 }
@@ -944,27 +1047,32 @@ static bool FindSilentTarget(const Vector& eye, const QAngle& camera, QAngle& ou
     int rank = -1;
     Vector target;
     int hb = -1;
+    bool can_shoot = false;
     if (vis_hc_rank >= 0) {
-        rank = vis_hc_rank; target = vis_hc_target; hb = vis_hc_hb;
+        rank = vis_hc_rank; target = vis_hc_target; hb = vis_hc_hb; can_shoot = true;
     } else if (vis_rank >= 0) {
-        rank = vis_rank; target = vis_target; hb = vis_hb;
+        rank = vis_rank; target = vis_target; hb = vis_hb; can_shoot = false;
     } else if (wall_hc_rank >= 0) {
-        rank = wall_hc_rank; target = wall_hc_target; hb = wall_hc_hb;
+        rank = wall_hc_rank; target = wall_hc_target; hb = wall_hc_hb; can_shoot = true;
     } else if (wall_rank >= 0) {
-        rank = wall_rank; target = wall_target; hb = wall_hb;
+        rank = wall_rank; target = wall_target; hb = wall_hb; can_shoot = false;
     }
     if (rank < 0) return false;
+    if (out_can_shoot) *out_can_shoot = can_shoot;
     int const idx = cands[rank].index;
     Vector const cur_origin = *reinterpret_cast<Vector*>((char*)cands[rank].ent + off::m_vecOrigin);
     Vector vo = *reinterpret_cast<Vector*>((char*)cands[rank].ent + off::m_vecViewOffset);
     if (!(vo.z > 1.0f && vo.z < 100.0f)) vo.z = 64.0f;
 
-    // backtrack: translate the chosen hitbox point by the historical origin delta,
-    // verify the historical point can still be hit, and rewind cmd->tick_count
-    if (cfg.backtrack && cfg.backtrack_time > 0.01f) {
+    // backtrack: only rewind to a historical record when the current position
+    // was not directly visible (e.g. target walked behind cover or wall-only hit)
+    // and ensure the historical simtime is strictly within sv_maxunlag (0.2s).
+    if (cfg.backtrack && cfg.backtrack_time > 0.01f && vis_rank < 0) {
         Vector bt;
         float bt_sim = 0.0f;
-        if (Backtrack_PickRecord(idx, cfg.backtrack_time, bt, bt_sim)) {
+        float const now_eng = engine.self ? engine.Time() : 0.0f;
+        if (Backtrack_PickRecord(idx, cfg.backtrack_time, bt, bt_sim) &&
+            bt_sim > 0.0f && (now_eng <= 0.0f || fabsf(now_eng - bt_sim) <= 0.20f)) {
             Vector const delta = bt - cur_origin;
             float const off2 = delta.x * delta.x + delta.y * delta.y + delta.z * delta.z;
             if (off2 < 64.0f * 64.0f) {
@@ -972,27 +1080,14 @@ static bool FindSilentTarget(const Vector& eye, const QAngle& camera, QAngle& ou
                 if (TraceVisible(eye, bt_target, cands[rank].ent) ||
                     (allow_wall_trace && CanPenetrateTarget(eye, bt_target, cands[rank].ent, hb, 1.0f))) {
                     target = bt_target;
-                    if (bt_sim > 0.0f)
-                        out_tick_count = (int)(0.5f + (bt_sim + GetLerpTime()) / GetIntervalPerTick());
+                    out_tick_count = (int)(0.5f + (bt_sim + GetLerpTime()) / GetIntervalPerTick());
                 }
             }
         }
     }
-    // resolver: shift the aim point sideways after consecutive misses
-    if (cfg.resolver) {
-        int const shift = Resolver_Side(idx);
-        if (shift != 0) {
-            QAngle const ba = CalcAngle(eye, target);
-            Vector fwd, right, up;
-            AngleVectors(ba, fwd, right, up);
-            target = target + right * (float)shift;
-        }
-    }
-
     out = CalcAngle(eye, target);
 
-    // remember what we fired at so bullet impacts can be graded against the
-    // aim point (miss log)
+    // remember what we fired at so player_hurt / bullet_impact can grade the shot
     {
         player_info_t info = {};
         if (engine.GetPlayerInfo(idx, &info) && info.name[0])
@@ -1005,6 +1100,8 @@ static bool FindSilentTarget(const Vector& eye, const QAngle& camera, QAngle& ou
         g_miss_target_idx = idx;
         g_miss_aimpoint = target;
         g_miss_pending = true;
+        g_miss_hurt_confirmed = false;
+        g_miss_impact_seen = false;
         g_miss_pending_time = GetTickCount64();
     }
     return true;
@@ -1055,19 +1152,32 @@ static void RunCombat(CUserCmd* cmd) {
 
     {
         ActiveAimSettings const aim = GetAimSettings( );
+        bool const is_sniper = (CurrentWeaponGroup() == 1);
         if ( aim.auto_stop && ( cmd->buttons & IN_ATTACK ) ) {
-            cmd->forwardmove = 0.0f;
-            cmd->sidemove = 0.0f;
+            Vector const vel = *reinterpret_cast<Vector*>((char*)local + off::m_vecVelocity);
+            float const spd = sqrtf(vel.x * vel.x + vel.y * vel.y);
+            if (spd > 12.0f) {
+                float const stop_yaw = atan2f(-vel.y, -vel.x) * 57.29577951308232f;
+                float const dy = Deg2Rad(stop_yaw - cmd->viewangles.y);
+                cmd->forwardmove = cosf(dy) * 450.0f;
+                cmd->sidemove = -sinf(dy) * 450.0f;
+            } else {
+                cmd->forwardmove = 0.0f;
+                cmd->sidemove = 0.0f;
+            }
         }
-        if ( aim.auto_scope && CurrentWeaponGroup( ) == 1 && ( cmd->buttons & IN_ATTACK ) ) {
-            #ifdef _WIN64
+        if ( aim.auto_scope && is_sniper && ( cmd->buttons & IN_ATTACK ) ) {
+#ifdef _WIN64
             int const zoom = *reinterpret_cast<int*>( (char*)local + off::m_bIsScoped );
-            if ( zoom == 0 )
+            bool const need_scope = (zoom == 0);
 #else
             int const fov = *reinterpret_cast<int*>( (char*)local + off::m_iFOV );
-            if ( fov == 0 || fov == 90 )
+            bool const need_scope = (fov == 0 || fov >= 90);
 #endif
+            if (need_scope) {
                 cmd->buttons |= IN_ATTACK2;
+                cmd->buttons &= ~IN_ATTACK; // scope before firing instead of shooting unscoped
+            }
         }
     }
 
@@ -1137,7 +1247,10 @@ static void RunCombat(CUserCmd* cmd) {
 
     bool const trig_on = cfg.triggerbot ||
         BindActive(cfg.kb_triggerbot, cfg.kb_mode_triggerbot, BIND_TRIGGERBOT);
-    if (!knife && trig_on && !cfg.menu_open && WeaponCanFire(local) &&
+    // When silent aim is enabled, BaseCreateMove drives rage auto-fire directly
+    // through FindSilentTarget() so min_damage, autowall, hitchance, auto-stop,
+    // and auto-scope stay 100% synchronized.
+    if (!knife && !cfg.silentaim && trig_on && !cfg.menu_open && WeaponCanFire(local) &&
         *reinterpret_cast<char*>((char*)local + off::m_lifeState) == 0 &&
         *reinterpret_cast<int*>((char*)local + off::m_iHealth) > 0) {
         bool fire = false;
@@ -1398,27 +1511,114 @@ static void RunAntiAim(CUserCmd* cmd, const QAngle& base) {
     aa_view_angles = out;
 }
 
+static bool ActiveWeaponIsUtility() {
+    void* local = GetLocalEntity();
+    if (!local) return true;
+    int const handle = *reinterpret_cast<int*>((char*)local + off::m_hActiveWeapon);
+    int const idx = handle & 0xFFF;
+    if (idx <= 0) return true;
+    void* nw = entity_list.GetClientNetworkable(idx);
+    if (!nw) return true;
+    void* cc = VFunc<void*(THISCALL_CC*)(void*)>(nw, 2)(nw);
+    const char* cls = ClientClassName(cc);
+    if (!cls) return false;
+    return strstr(cls, "Knife") || strstr(cls, "knife") ||
+           strstr(cls, "Grenade") || strstr(cls, "Flashbang") ||
+           strstr(cls, "C4");
+}
+
 static bool RunSilentAim(CUserCmd* cmd, const QAngle& camera) {
-    if (!cfg.silentaim || !BindActive(cfg.kb_silentaim, cfg.kb_mode_silentaim, BIND_SILENTAIM) || !cmd || !(cmd->buttons & IN_ATTACK) || !IsGameReady())
+    if (!cfg.silentaim || !BindActive(cfg.kb_silentaim, cfg.kb_mode_silentaim, BIND_SILENTAIM) || !cmd || !IsGameReady())
+        return false;
+    if (ActiveWeaponIsUtility())
         return false;
 
     void* local = GetLocalEntity();
-    Vector eye = local ? PlayerEye(local) : Vector(0, 0, 0);
+    if (!local || *reinterpret_cast<char*>((char*)local + off::m_lifeState) != 0)
+        return false;
 
+    bool const trig_on = cfg.triggerbot ||
+        BindActive(cfg.kb_triggerbot, cfg.kb_mode_triggerbot, BIND_TRIGGERBOT);
+    bool const manual_attack = (cmd->buttons & IN_ATTACK) != 0;
+    if (!trig_on && !manual_attack)
+        return false;
+
+    bool const can_fire = WeaponCanFire(local);
+    ActiveAimSettings const aim = GetAimSettings();
+    if (trig_on && !can_fire && !manual_attack) {
+        if (!aim.auto_scope && !aim.auto_stop)
+            return false;
+        static int s_idle_scan = 0;
+        if ((s_idle_scan++ & 3) != 0)
+            return false;
+    }
+
+    Vector eye = PlayerEye(local);
     QAngle target;
     int bt_tick = 0;
-    if (FindSilentTarget(eye, camera, target, bt_tick)) {
-        cmd->viewangles = target; // outgoing command only; camera is restored
-        if (bt_tick > 0)
-            cmd->tick_count = bt_tick;
-        return true;
-    } else if (cfg.log_misses) {
-        static bool no_target_prev = false;
-        bool const attack = (cmd->buttons & IN_ATTACK) != 0;
-        if (attack && !no_target_prev) {
-            MissLog_Push("Missed shot due to ", "no target in FOV");
+    bool can_shoot = false;
+    bool const found = FindSilentTarget(eye, camera, target, bt_tick, true, &can_shoot);
+
+    static ULONGLONG s_rage_acquire = 0;
+    static bool s_rage_had = false;
+    ULONGLONG const now_r = GetTickCount64();
+
+    if (found) {
+        int const flags = *reinterpret_cast<int*>((char*)local + off::m_fFlags);
+        if (aim.auto_stop && (flags & FL_ONGROUND)) {
+            Vector const vel = *reinterpret_cast<Vector*>((char*)local + off::m_vecVelocity);
+            float const spd = sqrtf(vel.x * vel.x + vel.y * vel.y);
+            cmd->buttons &= ~(IN_FORWARD | IN_BACK | IN_MOVELEFT | IN_MOVERIGHT);
+            if (spd > 15.0f) {
+                float const stop_yaw = atan2f(-vel.y, -vel.x) * 57.29577951308232f;
+                float const dy = Deg2Rad(stop_yaw - camera.y);
+                cmd->forwardmove = cosf(dy) * 450.0f;
+                cmd->sidemove = -sinf(dy) * 450.0f;
+            } else {
+                cmd->forwardmove = 0.0f;
+                cmd->sidemove = 0.0f;
+            }
         }
-        no_target_prev = attack;
+        if (aim.auto_scope && CurrentWeaponGroup() == 1) {
+#ifdef _WIN64
+            int const zoom = *reinterpret_cast<int*>((char*)local + off::m_bIsScoped);
+            bool const need_scope = (zoom == 0);
+#else
+            int const fov = *reinterpret_cast<int*>((char*)local + off::m_iFOV);
+            bool const need_scope = (fov == 0 || fov >= 90);
+#endif
+            if (need_scope) {
+                static ULONGLONG s_last_scope_ms = 0;
+                if (now_r - s_last_scope_ms >= 150) {
+                    cmd->buttons |= IN_ATTACK2;
+                    s_last_scope_ms = now_r;
+                }
+                cmd->buttons &= ~IN_ATTACK;
+                return false;
+            }
+        }
+
+        if (trig_on && can_fire && can_shoot) {
+            if (!s_rage_had) { s_rage_had = true; s_rage_acquire = now_r; }
+            if (aim.delay_shot <= 0 || (now_r - s_rage_acquire) >= (ULONGLONG)aim.delay_shot) {
+                cmd->buttons |= IN_ATTACK;
+                s_rage_had = false;
+            }
+        }
+        if (cmd->buttons & IN_ATTACK) {
+            cmd->viewangles = target; // outgoing command only; camera is restored
+            if (bt_tick > 0)
+                cmd->tick_count = bt_tick;
+            return true;
+        }
+    } else {
+        s_rage_had = false;
+        if (cfg.log_misses && manual_attack) {
+            static bool no_target_prev = false;
+            if (!no_target_prev)
+                MissLog_Push("Missed shot due to ", "no target in FOV");
+            no_target_prev = true;
+        }
     }
     return false;
 }
@@ -1692,10 +1892,56 @@ static HOOK_THISCALL(void, HookedFrameStageNotify, void*, int stage) {
             }
         }
     }
+    if (stage == 2 /* FRAME_NET_UPDATE_POSTDATAUPDATE_START */)
+        Resolver_ApplyFrameStage();
     if (oFrameStageNotify) oFrameStageNotify(self, stage);
     Lua_OnFrameStage(stage);
-    if (stage == FRAME_RENDER_START)
+    if (stage == FRAME_RENDER_START) {
+        Resolver_ApplyFrameStage();
         Bones_OnFrameStage();
+#ifndef _WIN64
+        // Lazily hook IGameResources::GetPlayerName (vtable[8] = +0x20 on g_PR + 0x460)
+        // so the CS:S v34 TAB scoreboard displays detected cheats inline (e.g. [ISLAMWARE] Name).
+        if (IsGameReady() && client_module) {
+            static void* s_patched_gr_vt = nullptr;
+            typedef const char* (__thiscall* GetPlayerNameFn)(void*, int);
+            static GetPlayerNameFn oGetPlayerName = nullptr;
+            static auto HookedGetPlayerName = [](void* gr, void*, int index) __attribute__((fastcall)) -> const char* {
+                const char* orig = oGetPlayerName ? oGetPlayerName(gr, index) : "";
+                if (!cfg.cheat_revealer || !orig || !orig[0] || index <= 0 || index > 64)
+                    return orig;
+                static char s_tab_names[65][96] = {};
+                player_info_t pi = {};
+                const char* tag = nullptr;
+                if (engine.self && engine.GetPlayerInfo(index, &pi) && !pi.fakeplayer)
+                    tag = CheatRevealer_Identify(pi.friendsName, pi.name);
+                if (!tag && engine.self && index == engine.GetLocalPlayer()) {
+                    static const char* const kLocalTabNames[9] = {
+                        "ISLAMWARE", "ISLAMWARE", "EPOXIMOTION", "POPTAPE", "CLARET", "KILLED", "NEVERLOSE", "SKEET", "INSOMNIA"
+                    };
+                    int const si = (cfg.cheat_spoofer >= 0 && cfg.cheat_spoofer < 9) ? cfg.cheat_spoofer : 1;
+                    tag = kLocalTabNames[si];
+                }
+                if (tag && tag[0]) {
+                    snprintf(s_tab_names[index], sizeof(s_tab_names[index]), "[%s] %s", tag, orig);
+                    return s_tab_names[index];
+                }
+                return orig;
+            };
+            void* pr = *reinterpret_cast<void**>((uintptr_t)client_module + 0x3ba3c0);
+            if (pr) {
+                void* gr = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(pr) + 0x460);
+                void** gr_vt = *reinterpret_cast<void***>(gr);
+                if (gr_vt && gr_vt != s_patched_gr_vt) {
+                    if (PatchVtable(gr_vt, 8, (void*)+HookedGetPlayerName, (void**)&oGetPlayerName)) {
+                        s_patched_gr_vt = gr_vt;
+                        Log("[revealer] v34 IGameResources::GetPlayerName hooked (vt=%p)", (void*)gr_vt);
+                    }
+                }
+            }
+        }
+#endif
+    }
     if (stage == 4 /* FRAME_NET_UPDATE_POSTDATAUPDATE_END */ || stage == FRAME_RENDER_END)
         ClientModel_OnFrameStage(stage);
     if (stage == FRAME_RENDER_END && g_obs_mode_patched) {
@@ -1828,23 +2074,29 @@ static void RunNoSpread(CUserCmd* cmd, bool do_spread, bool do_recoil) {
             sy = sinf(a) * b + sinf(c) * d;
 #else
             // v34 FX_FireBullets triangular spread: RandomFloat(-0.5, 0.5) + RandomFloat(-0.5, 0.5)
-            float x, y;
+            float rx1 = 0.0f, rx2 = 0.0f, ry1 = 0.0f, ry2 = 0.0f;
             if (vRandomSeed && vRandomFloat) {
                 vRandomSeed(seed);
-                x = vRandomFloat(-0.5f, 0.5f) + vRandomFloat(-0.5f, 0.5f);
-                y = vRandomFloat(-0.5f, 0.5f) + vRandomFloat(-0.5f, 0.5f);
+                rx1 = vRandomFloat(-0.5f, 0.5f);
+                rx2 = vRandomFloat(-0.5f, 0.5f);
+                ry1 = vRandomFloat(-0.5f, 0.5f);
+                ry2 = vRandomFloat(-0.5f, 0.5f);
             } else {
                 SrcRandomSeed(seed);
-                x = SrcRandomFloat(-0.5f, 0.5f) + SrcRandomFloat(-0.5f, 0.5f);
-                y = SrcRandomFloat(-0.5f, 0.5f) + SrcRandomFloat(-0.5f, 0.5f);
+                rx1 = SrcRandomFloat(-0.5f, 0.5f);
+                rx2 = SrcRandomFloat(-0.5f, 0.5f);
+                ry1 = SrcRandomFloat(-0.5f, 0.5f);
+                ry2 = SrcRandomFloat(-0.5f, 0.5f);
             }
-            sx = x * flSpread;
-            sy = y * flSpread;
+            sx = (rx1 + rx2) * flSpread;
+            sy = (ry1 + ry2) * flSpread;
 #endif
 
             Vector desired_fwd;
             AngleVectors(cmd->viewangles, desired_fwd);
-            for (int iter = 0; iter < 3; iter++) {
+            // The server evaluates AngleVectors(cmd->viewangles + 2 * punch),
+            // so solve for total_shoot first, then subtract 2 * punch at the end.
+            for (int iter = 0; iter < 5; iter++) {
                 Vector f, r, u;
                 AngleVectors(shot, f, r, u);
                 Vector corr = desired_fwd - r * sx - u * sy;
@@ -2250,33 +2502,21 @@ static HOOK_THISCALL(void, HookedBaseCreateMove, void*, int sequence_number, flo
     RunExploits(cmd, local);
 
     // Double tap: semi-auto/bolt weapons only fire on a fresh IN_ATTACK press
-    // edge, so holding the button never repeats.  While attack is held, clear
-    // the bit every other tick: the engine then sees press/release/press and
-    // fires again as soon as the weapon cooldown is over, i.e. the pistol or
-    // sniper fires at its maximum rate without re-clicking.  Automatic
-    // weapons already fire while held and are left untouched.  Runs BEFORE
-    // silent aim so the extra press ticks get the silent-aim angle.
+    // edge.  Clear IN_ATTACK ONLY while the weapon is on cooldown (!WeaponCanFire)
+    // so the very tick the gun becomes ready sees a fresh 0->1 press edge!
     if (cfg.double_tap && IsGameReady()) {
         static int dt_auto_tick = 0;
         static bool dt_auto = false;
-        static bool dt_clear = false;
         if (cmd->buttons & IN_ATTACK) {
             if ((dt_auto_tick++ & 7) == 0)
                 dt_auto = ActiveWeaponIsAutomatic();
-            if (!dt_auto) {
-                if (dt_clear)
-                    cmd->buttons &= ~IN_ATTACK;
-                dt_clear = !dt_clear;
-            }
-        } else {
-            dt_clear = false;
+            if (!dt_auto && !WeaponCanFire(local))
+                cmd->buttons &= ~IN_ATTACK;
         }
     }
 
-    // Silent aim must write into the command the engine actually sends.  In
-    // ClientMode::CreateMove the angle was being lost before the outgoing
-    // copy was built, so the server kept firing along the camera/anti-aim
-    // angle - every shot missed.  Apply it here, on the outgoing cmd.
+    // Silent aim must write into the command the engine actually sends.
+    MissLog_Tick();
     SetStage("silentaim");
     bool const silent_applied = RunSilentAim(cmd, real_view_angles);
 
@@ -2286,10 +2526,9 @@ static HOOK_THISCALL(void, HookedBaseCreateMove, void*, int sequence_number, flo
     if (knife_applied)
         cmd->viewangles = g_knife_angle;
 
-    // Anti-aim must never overwrite a shot: if the fake yaw reaches the
-    // server on an attack tick, the bullet goes where the fake body looks.
+    // Anti-aim must never overwrite a shot or a silent-aim tick.
     bool const attacking_now = (cmd->buttons & IN_ATTACK) != 0 && WeaponCanFire(local);
-    if (cfg.aa_enabled && !attacking_now && !knife_applied)
+    if (cfg.aa_enabled && !attacking_now && !silent_applied && !knife_applied)
         RunAntiAim(cmd, real_view_angles);
 
     // Super Toss: compensate grenade throw angle for player velocity so the
@@ -2332,11 +2571,12 @@ static HOOK_THISCALL(void, HookedBaseCreateMove, void*, int sequence_number, flo
     RunExtraMovement(cmd, local, user_camera_angles);
     RunPeekAssist(cmd, local, user_camera_angles, raw_buttons, raw_forward, raw_side,
                   attacking_now || silent_applied || shot_fired_clip);
-    FixMovement(cmd, user_camera_angles);
 
     // seed-based spread & recoil compensation (after silent aim sets the shot angle)
-    if (attacking_now && !knife_applied)
+    if ((attacking_now || silent_applied) && !knife_applied)
         RunNoSpread(cmd, cfg.nospread, silent_applied || cfg.nospread);
+
+    FixMovement(cmd, user_camera_angles);
 
     Lua_OnCreateMove(cmd);
 
@@ -2359,15 +2599,30 @@ HOOK_THISCALL(void, HookedOverrideView, void*, CViewSetup* setup) {
     if (oOverrideView) oOverrideView(self, setup);
     if (!setup) return;
 
-    if (cfg.fov_override >= 1.0f)
-        setup->fov = (cfg.fov_override < 20.0f) ? 20.0f : (cfg.fov_override > 160.0f ? 160.0f : cfg.fov_override);
-    if (cfg.viewmodel_fov >= 1.0f)
-        setup->fov_viewmodel = (cfg.viewmodel_fov < 20.0f) ? 20.0f : (cfg.viewmodel_fov > 160.0f ? 160.0f : cfg.viewmodel_fov);
-
+    static float s_unzoomed_fov = 90.0f;
     void* local_ov = GetLocalEntity();
     bool const local_alive_ov = local_ov &&
         *reinterpret_cast<const char*>((const char*)local_ov + off::m_lifeState) == 0 &&
         *reinterpret_cast<const int*>((const char*)local_ov + off::m_iObserverMode) == 0;
+
+    bool local_scoped = false;
+    if (local_alive_ov) {
+#ifdef _WIN64
+        local_scoped = (*reinterpret_cast<const int*>((const char*)local_ov + off::m_bIsScoped) != 0);
+#else
+        int const lf = *reinterpret_cast<const int*>((const char*)local_ov + off::m_iFOV);
+        local_scoped = (lf > 0 && lf < 90);
+#endif
+        if (!local_scoped && setup->fov >= 50.0f && setup->fov <= 160.0f)
+            s_unzoomed_fov = setup->fov;
+    }
+
+    if (cfg.fov_override >= 1.0f)
+        setup->fov = (cfg.fov_override < 20.0f) ? 20.0f : (cfg.fov_override > 160.0f ? 160.0f : cfg.fov_override);
+    else if (cfg.no_scope_zoom && local_scoped)
+        setup->fov = s_unzoomed_fov;
+    if (cfg.viewmodel_fov >= 1.0f)
+        setup->fov_viewmodel = (cfg.viewmodel_fov < 20.0f) ? 20.0f : (cfg.viewmodel_fov > 160.0f ? 160.0f : cfg.viewmodel_fov);
 
     if ((cfg.aa_enabled || cfg.silentaim || cfg.super_toss) && local_alive_ov) {
         // engine.dll keeps the view angles in a global (rva 0x53E4E4) that
@@ -3046,7 +3301,7 @@ static int DrawModelExecuteInner( void* self, void* state, ModelRenderInfo_t* in
         (cfg.wchams_enemy && (cfg.chams_enemy.visible.enabled || cfg.chams_enemy.occluded.enabled || cfg.chams_enemy.overlay.enabled)) ||
         (cfg.wchams_team && (cfg.chams_team.visible.enabled || cfg.chams_team.occluded.enabled || cfg.chams_team.overlay.enabled));
     bool const want_plr_chams_any =
-        (cfg.backtrack && cfg.backtrack_chams) || cfg.chams_hit ||
+        (cfg.backtrack && cfg.backtrack_chams) || cfg.chams_hit || cfg.chams_fake ||
         cfg.chams_enemy.visible.enabled || cfg.chams_enemy.occluded.enabled || cfg.chams_enemy.overlay.enabled ||
         cfg.chams_team.visible.enabled  || cfg.chams_team.occluded.enabled  || cfg.chams_team.overlay.enabled  ||
         cfg.chams_local.visible.enabled || cfg.chams_local.occluded.enabled || cfg.chams_local.overlay.enabled;
@@ -3263,7 +3518,7 @@ static int DrawModelExecuteInner( void* self, void* state, ModelRenderInfo_t* in
     }
 
     bool const want_player_chams =
-        (cfg.backtrack && cfg.backtrack_chams) || cfg.chams_hit ||
+        (cfg.backtrack && cfg.backtrack_chams) || cfg.chams_hit || cfg.chams_fake ||
         cfg.chams_enemy.visible.enabled || cfg.chams_enemy.occluded.enabled || cfg.chams_enemy.overlay.enabled ||
         cfg.chams_team.visible.enabled  || cfg.chams_team.occluded.enabled  || cfg.chams_team.overlay.enabled  ||
         cfg.chams_local.visible.enabled || cfg.chams_local.occluded.enabled || cfg.chams_local.overlay.enabled;
@@ -3333,6 +3588,77 @@ static int DrawModelExecuteInner( void* self, void* state, ModelRenderInfo_t* in
         if ( alive ) {
             int local_index = engine.GetLocalPlayer( );
             bool is_local = info->entity_index == local_index;
+
+            // Helper: draw translucent ghost copy of local player AFTER the real model
+            // has already rendered, strictly anchored to info->origin (never m_vecOrigin)
+            // and only on the main opaque render pass (skip shadow/depth passes).
+            auto draw_fake_ghost = [&]() {
+                static bool s_in_fake_draw = false;
+                if ( s_in_fake_draw ) return;
+                if ( !is_local || !cfg.chams_fake || !cfg.aa_enabled || !LocalCanThirdPerson( ) || !info->pRenderable )
+                    return;
+                if ( (info->flags & 0x40) != 0 || (info->flags & 1) == 0 )
+                    return;
+
+                float delta_yaw = NormalizeYaw( real_view_angles.y - aa_view_angles.y );
+                if ( fabsf( delta_yaw ) < 15.0f ) delta_yaw = 120.0f;
+                float const rad = Deg2Rad( delta_yaw );
+                float const cs = cosf( rad );
+                float const sn = sinf( rad );
+                // Anchor strictly to this draw call's exact interpolated world origin
+                Vector const org = info->origin;
+                auto rot_bone = [&]( matrix3x4_t& m ) {
+                    float const r00 = cs * m.m[0][0] - sn * m.m[1][0];
+                    float const r10 = sn * m.m[0][0] + cs * m.m[1][0];
+                    float const r01 = cs * m.m[0][1] - sn * m.m[1][1];
+                    float const r11 = sn * m.m[0][1] + cs * m.m[1][1];
+                    float const r02 = cs * m.m[0][2] - sn * m.m[1][2];
+                    float const r12 = sn * m.m[0][2] + cs * m.m[1][2];
+                    float const dx = m.m[0][3] - org.x;
+                    float const dy = m.m[1][3] - org.y;
+                    m.m[0][0] = r00; m.m[1][0] = r10;
+                    m.m[0][1] = r01; m.m[1][1] = r11;
+                    m.m[0][2] = r02; m.m[1][2] = r12;
+                    m.m[0][3] = org.x + cs * dx - sn * dy;
+                    m.m[1][3] = org.y + sn * dx + cs * dy;
+                };
+                void* fmat = GetChamsMaterial( 1 /*flat*/, false, cfg.chams_fake_color );
+                if ( !fmat ) return;
+                s_in_fake_draw = true;
+#ifdef _WIN64
+                if ( bones ) {
+                    int bc = 128;
+                    int const cached = *reinterpret_cast<int const*>( (char*)info->pRenderable + 0xB50 );
+                    if ( cached > 0 && cached <= 128 ) bc = cached;
+                    static matrix3x4_t fake_bones[128];
+                    matrix3x4_t const* src = ( matrix3x4_t const* )bones;
+                    for ( int bi = 0; bi < bc; bi++ ) {
+                        fake_bones[bi] = src[bi];
+                        rot_bone( fake_bones[bi] );
+                    }
+                    ApplyChamsMaterial( fmat, cfg.chams_fake_color, false, false, false );
+                    CallOrigDrawModel( self, state, info, fake_bones );
+                    ResetChamsMaterial( );
+                }
+#else
+                matrix3x4_t* cached_bones = *reinterpret_cast<matrix3x4_t**>( (char*)info->pRenderable + 0x66c );
+                int const cached_count = *reinterpret_cast<int*>( (char*)info->pRenderable + 0x678 );
+                if ( cached_bones && cached_count > 0 && cached_count <= 128 ) {
+                    static matrix3x4_t saved_bones[128];
+                    for ( int bi = 0; bi < cached_count; bi++ ) {
+                        saved_bones[bi] = cached_bones[bi];
+                        rot_bone( cached_bones[bi] );
+                    }
+                    ApplyChamsMaterial( fmat, cfg.chams_fake_color, false, false, false );
+                    CallOrigDrawModel( self, state, info, bones );
+                    ResetChamsMaterial( );
+                    for ( int bi = 0; bi < cached_count; bi++ )
+                        cached_bones[bi] = saved_bones[bi];
+                }
+#endif
+                s_in_fake_draw = false;
+            };
+
             void* local_ent = local_index > 0 ? entity_list.GetClientEntity( local_index ) : nullptr;
             int local_team = local_ent ? *reinterpret_cast<int*>( (char*)local_ent + off::m_iTeamNum ) : 0;
             bool is_teammate = !is_local && team == local_team;
@@ -3432,6 +3758,12 @@ static int DrawModelExecuteInner( void* self, void* state, ModelRenderInfo_t* in
                     }
                 }
 
+                draw_fake_ghost();
+                return result;
+            }
+            if ( is_local && cfg.chams_fake && cfg.aa_enabled && LocalCanThirdPerson( ) ) {
+                int const result = CallOrigDrawModel( self, state, info, bones );
+                draw_fake_ghost();
                 return result;
             }
         }
@@ -3684,6 +4016,24 @@ static void CenterCursor(HWND hwnd) {
     SetCursorPos(p.x, p.y);
 }
 
+static void PasteClipboardAsChars(HWND hwnd, WNDPROC next_proc) {
+    if (!OpenClipboard(hwnd)) return;
+    HANDLE h = GetClipboardData(CF_TEXT);
+    if (h) {
+        const char* txt = static_cast<const char*>(GlobalLock(h));
+        if (txt) {
+            for (const char* p = txt; *p; ++p) {
+                unsigned char c = static_cast<unsigned char>(*p);
+                if (c == '\r' || c == '\n') break;
+                if (c >= 0x20 && c < 0x7F)
+                    CallWindowProcA(next_proc, hwnd, WM_CHAR, (WPARAM)c, 1);
+            }
+            GlobalUnlock(h);
+        }
+    }
+    CloseClipboard();
+}
+
 static LRESULT CALLBACK HookedWndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
     if (msg == WM_SETCURSOR && cfg.menu_open) {
         SetCursor(nullptr);
@@ -3712,24 +4062,38 @@ static LRESULT CALLBACK HookedWndProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM
         return 0;
     }
 
-    if (g_imgui_win32_ready) {
+    if (g_imgui_win32_ready && cfg.menu_open) {
         ImGui_ImplWin32_WndProcHandler(hwnd, msg, wparam, lparam);
-        if (cfg.menu_open) {
-            switch (msg) {
-            case WM_INPUT:
-            case WM_MOUSEMOVE:
-            case WM_LBUTTONDOWN: case WM_LBUTTONUP:
-            case WM_RBUTTONDOWN: case WM_RBUTTONUP:
-            case WM_MBUTTONDOWN: case WM_MBUTTONUP:
-            case WM_MOUSEWHEEL:
-            case WM_CHAR:
-            case WM_KEYDOWN: case WM_KEYUP:
-            case WM_SYSKEYDOWN: case WM_SYSKEYUP:
-                return 0;
-            default:
-                break;
-            }
+        switch (msg) {
+        case WM_INPUT:
+        case WM_MOUSEMOVE:
+        case WM_LBUTTONDOWN: case WM_LBUTTONUP: case WM_LBUTTONDBLCLK:
+        case WM_RBUTTONDOWN: case WM_RBUTTONUP: case WM_RBUTTONDBLCLK:
+        case WM_MBUTTONDOWN: case WM_MBUTTONUP: case WM_MBUTTONDBLCLK:
+        case WM_XBUTTONDOWN: case WM_XBUTTONUP: case WM_XBUTTONDBLCLK:
+        case WM_MOUSEWHEEL:
+        case WM_CHAR:
+        case WM_KEYDOWN: case WM_KEYUP:
+        case WM_SYSKEYDOWN: case WM_SYSKEYUP:
+            return 0;
+        default:
+            break;
         }
+    }
+
+    // Main menu (not in a match): Wine/v34 vgui2.dll crashes on right-click
+    // context menus (vgui2.dll+0xaac5), and macOS Cmd+V doesn't paste into
+    // VGUI2 text boxes.  Block main-menu right-click and translate Cmd+V.
+    if (!cfg.menu_open && (!IsGameReady() || GetLocalEntity() == nullptr)) {
+        if (msg == WM_RBUTTONDOWN || msg == WM_RBUTTONUP ||
+            msg == WM_RBUTTONDBLCLK || msg == WM_CONTEXTMENU) {
+            return 0;
+        }
+    }
+    if (!cfg.menu_open && msg == WM_KEYDOWN && wparam == 'V' &&
+        ((GetKeyState(VK_LWIN) & 0x8000) || (GetKeyState(VK_RWIN) & 0x8000))) {
+        PasteClipboardAsChars(hwnd, g_old_wndproc);
+        return 0;
     }
 
     return CallWindowProcA(g_old_wndproc, hwnd, msg, wparam, lparam);
@@ -4002,6 +4366,49 @@ void InstallClientModeHooks() {
         bool ok_sc = PatchVtable(slot, 0, (void*)+HookedHudScopePaint, (void**)&oHudScopePaint);
         Log("[scope] v34 CHudScope::Paint hook=%d orig=%p", ok_sc ? 1 : 0, (void*)oHudScopePaint);
     }
+
+    // CS:S v34 Cheat Spoofer: hook CBaseClientState::SendClientInfo (engine.dll + 0x4C1F0)
+    // and populate friendsName (+0x4AC8) with the selected hack ID.
+    if (engine_module) {
+        typedef void(__thiscall* SendClientInfoFn)(void*);
+        static SendClientInfoFn oSendClientInfo = nullptr;
+        static auto HookedSendClientInfo = [](void* self, void*) __attribute__((fastcall)) -> void {
+            if (self && cfg.cheat_spoofer > 0) {
+                static const char* const kSpoofTags[9] = {
+                    "", "1337", "epoximotion", "poptape", "claret", "killed", "neverlose", "skeet", "insomnia"
+                };
+                int const idx = (cfg.cheat_spoofer >= 0 && cfg.cheat_spoofer < 9) ? cfg.cheat_spoofer : 1;
+                char* hack_id_buf = reinterpret_cast<char*>(reinterpret_cast<uintptr_t>(self) + 0x4AC8);
+                strncpy(hack_id_buf, kSpoofTags[idx], 31);
+                hack_id_buf[31] = '\0';
+            }
+            if (oSendClientInfo) oSendClientInfo(self);
+        };
+        uint8_t* fn = reinterpret_cast<uint8_t*>((uintptr_t)engine_module + 0x4C1F0);
+        // Verify prologue: 6a ff 68 ?? ?? ?? ?? (push -1; push imm32 = 7 bytes)
+        if (fn[0] == 0x6A && fn[1] == 0xFF && fn[2] == 0x68) {
+            uint8_t* tramp = reinterpret_cast<uint8_t*>(
+                VirtualAlloc(nullptr, 32, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+            if (tramp) {
+                memcpy(tramp, fn, 7);
+                tramp[7] = 0xE9;
+                int32_t const back_rel = (int32_t)((fn + 7) - (tramp + 12));
+                memcpy(tramp + 8, &back_rel, 4);
+                oSendClientInfo = reinterpret_cast<SendClientInfoFn>(tramp);
+
+                DWORD old_prot = 0;
+                if (VirtualProtect(fn, 7, PAGE_EXECUTE_READWRITE, &old_prot)) {
+                    fn[0] = 0xE9;
+                    int32_t const hook_rel = (int32_t)(reinterpret_cast<uint8_t*>(+HookedSendClientInfo) - (fn + 5));
+                    memcpy(fn + 1, &hook_rel, 4);
+                    fn[5] = 0x90;
+                    fn[6] = 0x90;
+                    VirtualProtect(fn, 7, old_prot, &old_prot);
+                    Log("[spoofer] v34 SendClientInfo hooked at %p (tramp=%p)", (void*)fn, (void*)tramp);
+                }
+            }
+        }
+    }
 #endif
 
 #ifdef _WIN64
@@ -4155,6 +4562,103 @@ static void DrawOverlays(ImDrawList* draw, int w, int h) {
                 draw->AddRectFilledMultiColor(ImVec2(cx - outer + 1.f, cy), ImVec2(cx - inner + 1.f, cy + 1.f), far_col, near_col, near_col, far_col);
                 draw->AddRectFilledMultiColor(ImVec2(cx, cy + inner), ImVec2(cx + 1.f, cy + outer), near_col, near_col, far_col, far_col);
                 draw->AddRectFilledMultiColor(ImVec2(cx, cy - outer + 1.f), ImVec2(cx + 1.f, cy - inner + 1.f), far_col, far_col, near_col, near_col);
+            }
+        }
+    }
+
+    // Killed/Claret-style Penetration Crosshair: 3D cube indicator on the aimed wall/object
+    // colored green when penetratable and red when blocked, plus a crisp center dot.
+    if (cfg.pen_crosshair && IsGameReady()) {
+        void* local = GetLocalEntity();
+        if (local && !ActiveWeaponIsUtility() &&
+            *reinterpret_cast<const char*>((const char*)local + off::m_lifeState) == 0 &&
+            *reinterpret_cast<const int*>((const char*)local + off::m_iObserverMode) == 0) {
+            Vector eye = PlayerEye(local);
+            Vector hit_pos, hit_norm;
+            float pen_dmg = 0.0f;
+            bool const can_pen = PenetrationCrosshairCheck(eye, real_view_angles, hit_pos, hit_norm, pen_dmg);
+            float const* c = can_pen ? cfg.pen_crosshair_yes_color : cfg.pen_crosshair_no_color;
+            auto clamp01 = [](float v) { return v < 0.f ? 0.f : (v > 1.f ? 1.f : v); };
+            ImU32 const col = IM_COL32(
+                (int)(clamp01(c[0]) * 255.f),
+                (int)(clamp01(c[1]) * 255.f),
+                (int)(clamp01(c[2]) * 255.f),
+                (int)(clamp01(c[3]) * 255.f));
+            ImU32 const fill_col = IM_COL32(
+                (int)(clamp01(c[0]) * 255.f),
+                (int)(clamp01(c[1]) * 255.f),
+                (int)(clamp01(c[2]) * 255.f),
+                (int)(clamp01(c[3]) * 75.f));
+
+            // Render either 3D Box (style 0) or 2D Surface Box leaning flat on the surface (style 1)
+            if (hit_pos.x != eye.x || hit_pos.y != eye.y || hit_pos.z != eye.z) {
+                if (cfg.pen_crosshair_style == 1) {
+                    // 2D surface-aligned square lying flat on the hit wall/door/floor
+                    float nlen = sqrtf(hit_norm.x * hit_norm.x + hit_norm.y * hit_norm.y + hit_norm.z * hit_norm.z);
+                    Vector n = (nlen > 0.001f)
+                        ? Vector(hit_norm.x / nlen, hit_norm.y / nlen, hit_norm.z / nlen)
+                        : Vector(0.0f, 0.0f, 1.0f);
+                    Vector ref = (fabsf(n.z) < 0.9f) ? Vector(0.0f, 0.0f, 1.0f) : Vector(1.0f, 0.0f, 0.0f);
+                    // u = normalize(cross(ref, n)), v = cross(n, u)
+                    Vector u(ref.y * n.z - ref.z * n.y,
+                             ref.z * n.x - ref.x * n.z,
+                             ref.x * n.y - ref.y * n.x);
+                    float ulen = sqrtf(u.x * u.x + u.y * u.y + u.z * u.z);
+                    if (ulen > 0.001f) { u.x /= ulen; u.y /= ulen; u.z /= ulen; }
+                    Vector v(n.y * u.z - n.z * u.y,
+                             n.z * u.x - n.x * u.z,
+                             n.x * u.y - n.y * u.x);
+                    float const s = 3.2f;
+                    Vector const center = hit_pos + n * 0.25f;
+                    Vector const q[4] = {
+                        center - u * s - v * s,
+                        center + u * s - v * s,
+                        center + u * s + v * s,
+                        center - u * s + v * s,
+                    };
+                    ImVec2 sq[4];
+                    if (WorldToScreen(q[0], sq[0], w, h) && WorldToScreen(q[1], sq[1], w, h) &&
+                        WorldToScreen(q[2], sq[2], w, h) && WorldToScreen(q[3], sq[3], w, h)) {
+                        draw->AddQuadFilled(sq[0], sq[1], sq[2], sq[3], fill_col);
+                        draw->AddQuad(sq[0], sq[1], sq[2], sq[3], col, 1.4f);
+                    }
+                } else {
+                    // 3D cube (half-extent 2.2u) centered on the aimed wall/object
+                    float const s = 2.2f;
+                    Vector const corners[8] = {
+                        { hit_pos.x - s, hit_pos.y - s, hit_pos.z - s },
+                        { hit_pos.x + s, hit_pos.y - s, hit_pos.z - s },
+                        { hit_pos.x + s, hit_pos.y + s, hit_pos.z - s },
+                        { hit_pos.x - s, hit_pos.y + s, hit_pos.z - s },
+                        { hit_pos.x - s, hit_pos.y - s, hit_pos.z + s },
+                        { hit_pos.x + s, hit_pos.y - s, hit_pos.z + s },
+                        { hit_pos.x + s, hit_pos.y + s, hit_pos.z + s },
+                        { hit_pos.x - s, hit_pos.y + s, hit_pos.z + s },
+                    };
+                    ImVec2 sc[8];
+                    bool all_ok = true;
+                    for (int ci = 0; ci < 8; ci++) {
+                        if (!WorldToScreen(corners[ci], sc[ci], w, h)) { all_ok = false; break; }
+                    }
+                    if (all_ok) {
+                        static const int edges[12][2] = {
+                            {0,1},{1,2},{2,3},{3,0},
+                            {4,5},{5,6},{6,7},{7,4},
+                            {0,4},{1,5},{2,6},{3,7}
+                        };
+                        draw->AddQuadFilled(sc[0], sc[1], sc[2], sc[3], fill_col);
+                        draw->AddQuadFilled(sc[4], sc[5], sc[6], sc[7], fill_col);
+                        for (int ei = 0; ei < 12; ei++)
+                            draw->AddLine(sc[edges[ei][0]], sc[edges[ei][1]], col, 1.2f);
+                    }
+                }
+            }
+            // Optional center crosshair square dot indicator
+            if (cfg.pen_crosshair_dot) {
+                float const cx = floorf((float)w * 0.5f);
+                float const cy = floorf((float)h * 0.5f);
+                draw->AddRectFilled(ImVec2(cx - 2.f, cy - 2.f), ImVec2(cx + 3.f, cy + 3.f), IM_COL32(0, 0, 0, 200));
+                draw->AddRectFilled(ImVec2(cx - 1.f, cy - 1.f), ImVec2(cx + 2.f, cy + 2.f), col);
             }
         }
     }

@@ -32,6 +32,8 @@ struct BoneCacheEntry {
     int count;
     int frame;
     bool valid;
+    float simtime;
+    ULONGLONG last_ms;
     Vector origin;
     matrix3x4_t bones[128];
 };
@@ -653,6 +655,22 @@ struct WeaponPenStats {
     float pen_range;
 };
 
+static bool ContainsICase(const char* hay, const char* needle) {
+    if (!hay || !needle || !needle[0]) return false;
+    for (const char* h = hay; *h; ++h) {
+        const char* a = h;
+        const char* b = needle;
+        while (*a && *b) {
+            char ca = (*a >= 'A' && *a <= 'Z') ? (char)(*a + 32) : *a;
+            char cb = (*b >= 'A' && *b <= 'Z') ? (char)(*b + 32) : *b;
+            if (ca != cb) break;
+            ++a; ++b;
+        }
+        if (!*b) return true;
+    }
+    return false;
+}
+
 static bool GetActiveWeaponPenStats(WeaponPenStats& out) {
     // defaults if weapon class isn't recognized
     out = { 1, 30, 4096.0f, 0.85f, 1.0f, 21.0f, 800.0f };
@@ -671,36 +689,37 @@ static bool GetActiveWeaponPenStats(WeaponPenStats& out) {
     // (pen_power/pen_range verified against client.dll FireBullet).
     struct Entry { const char* token; WeaponPenStats s; };
     static const Entry table[] = {
-        { "AWP",      { 3, 115, 8192.0f, 0.990f, 1.95f, 45.0f, 8000.0f } },
-        { "G3SG1",    { 3,  80, 8192.0f, 0.980f, 1.65f, 39.0f, 5000.0f } },
-        { "Scout",    { 3,  75, 8192.0f, 0.980f, 1.70f, 39.0f, 5000.0f } },
-        { "SG550",    { 2,  70, 8192.0f, 0.980f, 1.45f, 35.0f, 4000.0f } },
-        { "AK47",     { 2,  36, 8192.0f, 0.980f, 1.55f, 39.0f, 5000.0f } },
-        { "M4A1",     { 2,  33, 8192.0f, 0.970f, 1.40f, 35.0f, 4000.0f } },
-        { "Aug",      { 2,  32, 8192.0f, 0.960f, 1.40f, 39.0f, 5000.0f } },
-        { "SG552",    { 2,  33, 8192.0f, 0.955f, 1.40f, 35.0f, 4000.0f } },
-        { "Galil",    { 2,  30, 8192.0f, 0.980f, 1.55f, 35.0f, 4000.0f } },
-        { "Famas",    { 2,  30, 8192.0f, 0.960f, 1.40f, 35.0f, 4000.0f } },
-        { "M249",     { 2,  32, 8192.0f, 0.970f, 1.50f, 35.0f, 4000.0f } },
-        { "Deagle",   { 2,  54, 4096.0f, 0.810f, 1.85f, 30.0f, 1000.0f } },
-        { "FiveSeven",{ 1,  25, 4096.0f, 0.885f, 1.50f, 30.0f, 2000.0f } },
-        { "P90",      { 1,  26, 4096.0f, 0.840f, 1.50f, 30.0f, 2000.0f } },
-        { "P228",     { 1,  40, 4096.0f, 0.800f, 1.25f, 25.0f,  800.0f } },
-        { "Glock",    { 1,  25, 4096.0f, 0.750f, 1.05f, 21.0f,  800.0f } },
-        { "Elite",    { 1,  45, 4096.0f, 0.750f, 1.05f, 21.0f,  800.0f } },
-        { "MP5",      { 1,  26, 4096.0f, 0.840f, 1.00f, 21.0f,  800.0f } },
-        { "TMP",      { 1,  26, 4096.0f, 0.840f, 1.00f, 21.0f,  800.0f } },
-        { "USP",      { 1,  34, 4096.0f, 0.790f, 1.00f, 15.0f,  500.0f } },
-        { "MAC10",    { 1,  29, 4096.0f, 0.820f, 0.95f, 15.0f,  500.0f } },
-        { "UMP45",    { 1,  30, 4096.0f, 0.820f, 1.00f, 15.0f,  500.0f } },
-        { "M3",       { 0,  22, 3000.0f, 0.700f, 1.00f,  0.0f,    0.0f } },
-        { "XM1014",   { 0,  22, 3000.0f, 0.700f, 1.00f,  0.0f,    0.0f } },
-        { "Knife",    { 0,  50,   64.0f, 1.000f, 1.00f,  0.0f,    0.0f } },
-        { "CC4",      { 0,   0,    0.0f, 1.000f, 1.00f,  0.0f,    0.0f } },
-        { "Grenade",  { 0,   0,    0.0f, 1.000f, 1.00f,  0.0f,    0.0f } },
+        { "awp",      { 3, 115, 8192.0f, 0.990f, 1.95f, 45.0f, 8000.0f } },
+        { "g3sg1",    { 3,  80, 8192.0f, 0.980f, 1.65f, 39.0f, 5000.0f } },
+        { "scout",    { 3,  75, 8192.0f, 0.980f, 1.70f, 39.0f, 5000.0f } },
+        { "sg550",    { 2,  70, 8192.0f, 0.980f, 1.45f, 35.0f, 4000.0f } },
+        { "ak47",     { 2,  36, 8192.0f, 0.980f, 1.55f, 39.0f, 5000.0f } },
+        { "m4a1",     { 2,  33, 8192.0f, 0.970f, 1.40f, 35.0f, 4000.0f } },
+        { "aug",      { 2,  32, 8192.0f, 0.960f, 1.40f, 39.0f, 5000.0f } },
+        { "sg552",    { 2,  33, 8192.0f, 0.955f, 1.40f, 35.0f, 4000.0f } },
+        { "galil",    { 2,  30, 8192.0f, 0.980f, 1.55f, 35.0f, 4000.0f } },
+        { "famas",    { 2,  30, 8192.0f, 0.960f, 1.40f, 35.0f, 4000.0f } },
+        { "m249",     { 2,  32, 8192.0f, 0.970f, 1.50f, 35.0f, 4000.0f } },
+        { "deagle",   { 2,  54, 4096.0f, 0.810f, 1.85f, 30.0f, 1000.0f } },
+        { "fiveseven",{ 1,  25, 4096.0f, 0.885f, 1.50f, 30.0f, 2000.0f } },
+        { "p90",      { 1,  26, 4096.0f, 0.840f, 1.50f, 30.0f, 2000.0f } },
+        { "p228",     { 1,  40, 4096.0f, 0.800f, 1.25f, 25.0f,  800.0f } },
+        { "glock",    { 1,  25, 4096.0f, 0.750f, 1.05f, 21.0f,  800.0f } },
+        { "elite",    { 1,  45, 4096.0f, 0.750f, 1.05f, 21.0f,  800.0f } },
+        { "mp5",      { 1,  26, 4096.0f, 0.840f, 1.00f, 21.0f,  800.0f } },
+        { "tmp",      { 1,  26, 4096.0f, 0.840f, 1.00f, 21.0f,  800.0f } },
+        { "usp",      { 1,  34, 4096.0f, 0.790f, 1.00f, 15.0f,  500.0f } },
+        { "mac10",    { 1,  29, 4096.0f, 0.820f, 0.95f, 15.0f,  500.0f } },
+        { "ump45",    { 1,  30, 4096.0f, 0.820f, 1.00f, 15.0f,  500.0f } },
+        { "m3",       { 0,  22, 3000.0f, 0.700f, 1.00f,  0.0f,    0.0f } },
+        { "xm1014",   { 0,  22, 3000.0f, 0.700f, 1.00f,  0.0f,    0.0f } },
+        { "knife",    { 0,  50,   64.0f, 1.000f, 1.00f,  0.0f,    0.0f } },
+        { "cc4",      { 0,   0,    0.0f, 1.000f, 1.00f,  0.0f,    0.0f } },
+        { "grenade",  { 0,   0,    0.0f, 1.000f, 1.00f,  0.0f,    0.0f } },
+        { "flashbang",{ 0,   0,    0.0f, 1.000f, 1.00f,  0.0f,    0.0f } },
     };
     for (auto const& e : table) {
-        if (strstr(cls, e.token)) {
+        if (ContainsICase(cls, e.token)) {
             out = e.s;
             return true;
         }
@@ -775,12 +794,12 @@ bool CanPenetrateTarget(const Vector& from, const Vector& to, void* target, int 
 
     Vector dir = to - from;
     float const total_dist = sqrtf(dir.x * dir.x + dir.y * dir.y + dir.z * dir.z);
+    if (!(total_dist == total_dist) || total_dist > stats.range) return false;
     if (total_dist < 1.0f) {
         float const dmg = CalcHitDamage((float)stats.damage, stats.armor_ratio, stats.range_modifier, 0.0f, hitbox, target);
         if (out_damage) *out_damage = dmg;
         return dmg >= (min_damage > 0.0f ? min_damage : 1.0f);
     }
-    if (total_dist > stats.range) return false;
     dir.x /= total_dist; dir.y /= total_dist; dir.z /= total_dist;
 
     int pen_count = stats.penetration;
@@ -788,16 +807,21 @@ bool CanPenetrateTarget(const Vector& from, const Vector& to, void* target, int 
     float cur_damage = (float)stats.damage;
     float cur_max_range = stats.range;
     float traced_dist = 0.0f;
+    float last_dmg_dist = 0.0f;
     Vector cursor = from;
+    void* skip_extra = nullptr;
 
     constexpr unsigned int kMaskShot = 0x4600400Bu;
     constexpr int kContentsGrate = 0x8;
-    constexpr int kSolidExitMask = 0x400B; // CONTENTS_SOLID | WINDOW | GRATE | MOVEABLE
+    // Exact MASK_SOLID used by CS:S FireBullet TraceToExit (0x241cea0c)
+    constexpr int kSolidExitMask = 0x200400B;
 
     float const req_dmg = (min_damage > 0.0f) ? min_damage : 1.0f;
 
-    for (int iter = 0; iter < 5 && cur_damage >= 1.0f; iter++) {
-        float const remaining = cur_max_range - traced_dist;
+    for (int iter = 0; iter < 4 && cur_damage >= 1.0f; iter++) {
+        // Exact CS:S FireBullet (0x241cf041): ray length is cur_max_range directly,
+        // NOT (cur_max_range - traced_dist) which double-subtracted traced_dist.
+        float const remaining = cur_max_range;
         if (remaining <= 1.0f) return false;
 
         Vector const ray_end = cursor + dir * remaining;
@@ -809,8 +833,9 @@ bool CanPenetrateTarget(const Vector& from, const Vector& to, void* target, int 
         int contents = 0;
         bool startsolid = false;
 
-        TraceLine(cursor, ray_end, f1, hit1, local, nullptr, &hit_entity, &surf,
+        TraceLine(cursor, ray_end, f1, hit1, local, skip_extra, &hit_entity, &surf,
                   nullptr, kMaskShot, &surf_props, &contents, &startsolid);
+        skip_extra = nullptr;
 
         Vector const d_rem = to - cursor;
         float const dist_rem_to_target = sqrtf(d_rem.x * d_rem.x + d_rem.y * d_rem.y + d_rem.z * d_rem.z);
@@ -819,18 +844,28 @@ bool CanPenetrateTarget(const Vector& from, const Vector& to, void* target, int 
         // Reached the target entity directly or passed the target point without hitting a wall
         if ((target && hit_entity == target) || hit_dist >= dist_rem_to_target - 1.0f) {
             float const final_dist = traced_dist + dist_rem_to_target;
+            float const seg_dist = (final_dist > last_dmg_dist) ? (final_dist - last_dmg_dist) : 0.0f;
             float const final_dmg = CalcHitDamage(cur_damage, stats.armor_ratio,
-                                                  stats.range_modifier, final_dist, hitbox, target);
+                                                  stats.range_modifier, seg_dist, hitbox, target);
             if (out_damage) *out_damage = final_dmg;
             return final_dmg >= req_dmg;
         }
         if (f1 >= 1.0f) return false; // bullet ran out of remaining range before target
 
-        if (startsolid) return false;
-        if (surf && (strstr(surf, "sky") || strstr(surf, "SKY"))) return false;
+        // If cursor started inside a thin brush/door plane after a previous exit,
+        // nudge forward instead of immediately aborting penetration.
+        if (startsolid) {
+            if (iter == 0) return false;
+            cursor = cursor + dir * 2.0f;
+            traced_dist += 2.0f;
+            continue;
+        }
+        if (surf && (ContainsICase(surf, "sky"))) return false;
 
         float const tmp_dist = traced_dist + hit_dist;
-        cur_damage *= powf(stats.range_modifier, tmp_dist * 0.002f);
+        float const seg_dist = (tmp_dist > last_dmg_dist) ? (tmp_dist - last_dmg_dist) : 0.0f;
+        cur_damage *= powf(stats.range_modifier, seg_dist * 0.002f);
+        last_dmg_dist = tmp_dist;
 
         bool const is_grate = (contents & kContentsGrate) != 0;
         uint16_t const enter_mat = ResolveSurfaceMaterial(surf_props, surf);
@@ -849,14 +884,18 @@ bool CanPenetrateTarget(const Vector& from, const Vector& to, void* target, int 
         if (cur_pen_power <= 0.0f)
             return false;
 
-        // TraceToExit: step forward in 4u increments up to 128u until out of solid
-        // brush geometry, then trace backwards to find the exact exit surface.
+        // TraceToExit: check 4u first for thin doors/grates/glass, then step by 16u
+        // capped at the maximum thickness this weapon+material could ever penetrate.
         bool found_exit = false;
         Vector exit_pos;
         short exit_props = 0;
         const char* exit_surf = nullptr;
 
-        for (float step = 4.0f; step <= 128.0f; step += 4.0f) {
+        float max_step = cur_pen_power * pen_mod * 2.0f + 16.0f;
+        if (max_step > 128.0f) max_step = 128.0f;
+        if (max_step < 16.0f) max_step = 16.0f;
+
+        for (float step = 4.0f; step <= max_step; step = (step < 16.0f) ? 16.0f : (step + 16.0f)) {
             Vector const probe = hit1 + dir * step;
             int const pc = engine_trace.self ? engine_trace.GetPointContents(probe, nullptr) : 0;
             if (pc & kSolidExitMask)
@@ -879,6 +918,16 @@ bool CanPenetrateTarget(const Vector& from, const Vector& to, void* target, int 
                 found_exit = true;
                 break;
             }
+            // Thin doors / grates / glass / single-sided props: probe is already in
+            // open air and backward trace hit nothing (f2 >= 1.0f). Match CS:S
+            // FireBullet which accepts the exit instead of rejecting thin doors.
+            if (!exit_startsolid && f2 >= 1.0f) {
+                exit_pos = hit1 + dir * (step < 2.0f ? step : 2.0f);
+                exit_props = surf_props;
+                exit_surf = surf;
+                found_exit = true;
+                break;
+            }
         }
 
         if (!found_exit)
@@ -896,7 +945,9 @@ bool CanPenetrateTarget(const Vector& from, const Vector& to, void* target, int 
 
         cur_pen_power -= thickness / pen_mod;
         traced_dist = tmp_dist + thickness;
-        cursor = exit_pos;
+        // Nudge 0.5u past exit surface so the next trace never starts solid on
+        // the door's back plane.
+        cursor = exit_pos + dir * 0.5f;
         cur_max_range = (cur_max_range - traced_dist) * 0.5f;
         cur_damage *= dmg_mod;
         pen_count--;
@@ -906,6 +957,163 @@ bool CanPenetrateTarget(const Vector& from, const Vector& to, void* target, int 
 
 bool CanPenetrate(const Vector& from, const Vector& to, float, void* skip) {
     return CanPenetrateTarget(from, to, skip, 2, 1.0f, nullptr);
+}
+
+// Killed/Claret-style penetration crosshair: traces forward from eye along view
+// angles, reports the wall hit point, and checks whether the active weapon can
+// penetrate that wall/door/object.
+bool PenetrationCrosshairCheck(const Vector& from, const QAngle& angles,
+                               Vector& out_hit, Vector& out_normal, float& out_damage) {
+    out_damage = 0.0f;
+    out_hit = from;
+    out_normal = Vector(0.0f, 0.0f, 1.0f);
+    void* local = GetLocalEntity();
+    if (!local) return false;
+
+    WeaponPenStats stats{};
+    GetActiveWeaponPenStats(stats);
+    if (stats.damage <= 0 || stats.range <= 0.0f) return false;
+
+    Vector dir, right, up;
+    AngleVectors(angles, dir, right, up);
+    Vector const ray_end = from + dir * stats.range;
+
+    constexpr unsigned int kMaskShot = 0x4600400Bu;
+    constexpr int kContentsGrate = 0x8;
+    constexpr int kSolidExitMask = 0x200400B;
+
+    float f1 = 1.0f;
+    Vector hit1;
+    void* hit_entity = nullptr;
+    const char* surf = nullptr;
+    Vector normal(0.0f, 0.0f, 1.0f);
+    short surf_props = 0;
+    int contents = 0;
+    bool startsolid = false;
+
+    TraceLine(from, ray_end, f1, hit1, local, nullptr, &hit_entity, &surf,
+              &normal, kMaskShot, &surf_props, &contents, &startsolid);
+    if (f1 >= 1.0f || startsolid) return false;
+    if (surf && ContainsICase(surf, "sky")) return false;
+
+    out_hit = hit1;
+    out_normal = normal;
+
+    float const hit_dist = stats.range * f1;
+    bool const is_grate = (contents & kContentsGrate) != 0;
+    if (stats.penetration <= 0 && !is_grate) return false;
+    if (hit_dist > stats.pen_range && !is_grate) return false;
+    if (stats.pen_power <= 0.0f && !is_grate) return false;
+
+    uint16_t const enter_mat = ResolveSurfaceMaterial(surf_props, surf);
+    float pen_mod = 1.0f, dmg_mod = 0.5f;
+    if (is_grate) {
+        pen_mod = 1.0f;
+        dmg_mod = 0.99f;
+    } else {
+        GetMaterialParameters(enter_mat, pen_mod, dmg_mod);
+    }
+
+    float max_step = stats.pen_power * pen_mod * 2.0f + 16.0f;
+    if (max_step > 128.0f) max_step = 128.0f;
+    if (max_step < 16.0f) max_step = 16.0f;
+
+    bool found_exit = false;
+    Vector exit_pos;
+    short exit_props = 0;
+    const char* exit_surf = nullptr;
+
+    for (float step = 4.0f; step <= max_step; step = (step < 16.0f) ? 16.0f : (step + 16.0f)) {
+        Vector const probe = hit1 + dir * step;
+        int const pc = engine_trace.self ? engine_trace.GetPointContents(probe, nullptr) : 0;
+        if (pc & kSolidExitMask)
+            continue;
+
+        float f2 = 1.0f;
+        Vector hit2;
+        void* exit_ent = nullptr;
+        bool exit_startsolid = false;
+        TraceLine(probe, hit1, f2, hit2, local, nullptr, &exit_ent, &exit_surf,
+                  nullptr, kMaskShot, &exit_props, nullptr, &exit_startsolid);
+
+        if (exit_ent && exit_ent != hit_entity) {
+            TraceLine(probe, hit1, f2, hit2, local, exit_ent, nullptr, &exit_surf,
+                      nullptr, kMaskShot, &exit_props, nullptr, &exit_startsolid);
+        }
+
+        if (!exit_startsolid && f2 < 1.0f) {
+            exit_pos = hit2;
+            found_exit = true;
+            break;
+        }
+        if (!exit_startsolid && f2 >= 1.0f) {
+            exit_pos = hit1 + dir * 2.0f;
+            exit_props = surf_props;
+            exit_surf = surf;
+            found_exit = true;
+            break;
+        }
+    }
+    if (!found_exit) return false;
+
+    Vector const delta = exit_pos - hit1;
+    float const thickness = sqrtf(delta.x * delta.x + delta.y * delta.y + delta.z * delta.z);
+    uint16_t const exit_mat = ResolveSurfaceMaterial(exit_props, exit_surf);
+    if (enter_mat == exit_mat && (enter_mat == 'W' || enter_mat == 'M'))
+        pen_mod += pen_mod;
+
+    if (thickness > stats.pen_power * pen_mod)
+        return false;
+
+    float const dmg = (float)stats.damage * powf(stats.range_modifier, hit_dist * 0.002f) * dmg_mod;
+    out_damage = dmg;
+    return dmg >= 1.0f;
+}
+
+const char* CheatRevealer_Identify(const char* friends_name, const char* player_name,
+                                   uint32_t* out_rgba, const char** out_short_tag) {
+    if (out_short_tag) *out_short_tag = nullptr;
+    if (!friends_name || !friends_name[0]) return nullptr;
+    if (strcmp(friends_name, "0") == 0) return nullptr;
+    if (player_name && player_name[0] && strcmp(friends_name, player_name) == 0) return nullptr;
+
+    struct CheatSig { const char* token; const char* tab_name; const char* short_tag; uint32_t col; };
+    static const CheatSig sigs[] = {
+        { "islamware",   "ISLAMWARE",   "[IW]",  IM_COL32( 80, 225, 130, 255) },
+        { "1337",        "ISLAMWARE",   "[IW]",  IM_COL32( 80, 225, 130, 255) },
+        { "epoxi",       "EPOXIMOTION", "[EPI]", IM_COL32(255,  95, 190, 255) },
+        { "1488",        "EPOXIMOTION", "[EPI]", IM_COL32(255,  95, 190, 255) },
+        { "228",         "EPOXIMOTION", "[EPI]", IM_COL32(255,  95, 190, 255) },
+        { "1001",        "EPOXIMOTION", "[EPI]", IM_COL32(255,  95, 190, 255) },
+        { "poptape",     "POPTAPE",     "[PT]",  IM_COL32(120, 235, 255, 255) },
+        { "claret",      "CLARET",      "[CLR]", IM_COL32(230,  75,  95, 255) },
+        { "420",         "CLARET",      "[CLR]", IM_COL32(230,  75,  95, 255) },
+        { "1002",        "CLARET",      "[CLR]", IM_COL32(230,  75,  95, 255) },
+        { "killed",      "KILLED",      "[KLD]", IM_COL32(255, 145,  60, 255) },
+        { "666",         "KILLED",      "[KLD]", IM_COL32(255, 145,  60, 255) },
+        { "1003",        "KILLED",      "[KLD]", IM_COL32(255, 145,  60, 255) },
+        { "insomnia",    "INSOMNIA",    "[INS]", IM_COL32(155, 120, 255, 255) },
+        { "1004",        "INSOMNIA",    "[INS]", IM_COL32(155, 120, 255, 255) },
+        { "neverlose",   "NEVERLOSE",   "[NL]",  IM_COL32( 70, 175, 255, 255) },
+        { "1005",        "NEVERLOSE",   "[NL]",  IM_COL32( 70, 175, 255, 255) },
+        { "skeet",       "SKEET",       "[GS]",  IM_COL32(165, 240,  75, 255) },
+        { "gamesense",   "SKEET",       "[GS]",  IM_COL32(165, 240,  75, 255) },
+        { "1006",        "SKEET",       "[GS]",  IM_COL32(165, 240,  75, 255) },
+        { "aimware",     "AIMWARE",     "[AW]",  IM_COL32(245,  70,  70, 255) },
+        { "interium",    "INTERIUM",    "[INT]", IM_COL32(120, 200, 255, 255) },
+        { "nixware",     "NIXWARE",     "[NIX]", IM_COL32(255, 205,  75, 255) },
+        { "pandora",     "PANDORA",     "[PND]", IM_COL32(190, 115, 255, 255) },
+        { "iniuria",     "INIURIA",     "[INI]", IM_COL32( 95, 220, 220, 255) },
+    };
+    for (auto const& s : sigs) {
+        if (ContainsICase(friends_name, s.token)) {
+            if (out_rgba) *out_rgba = s.col;
+            if (out_short_tag) *out_short_tag = s.short_tag;
+            return s.tab_name;
+        }
+    }
+    if (out_rgba) *out_rgba = IM_COL32(215, 185, 110, 255);
+    return friends_name;
 }
 
 bool GetActiveWeaponDamageInfo(int& out_damage, float& out_armor_ratio, float& out_range_modifier) {
@@ -934,6 +1142,37 @@ bool GetEntityBonePos(int index, int bone, Vector& out) {
 #else
     Vector p(bones[bone].m[0][3], bones[bone].m[1][3], bones[bone].m[2][3]);
 #endif
+    Vector d = p - origin;
+    if (sqrtf(d.x * d.x + d.y * d.y + d.z * d.z) > 130.0f) return false;
+    out = p;
+    return true;
+}
+
+bool GetEntityHeadPos(int index, int bone, Vector& out) {
+    if (index < 1 || index > 64) return false;
+    void* entity = entity_list.GetClientEntity(index);
+    if (!entity) return false;
+    int count = 0;
+    Vector cached_org;
+    const matrix3x4_t* bones = GetEntityBonesPtr(index, entity, &count, &cached_org);
+    if (!bones || bone < 0 || bone >= count) return false;
+    Vector origin = *reinterpret_cast<Vector*>((char*)entity + off::m_vecOrigin);
+#ifndef _WIN64
+    Vector p(bones[bone].m[0][3] + (origin.x - cached_org.x),
+             bones[bone].m[1][3] + (origin.y - cached_org.y),
+             bones[bone].m[2][3] + (origin.z - cached_org.z));
+#else
+    Vector p(bones[bone].m[0][3], bones[bone].m[1][3], bones[bone].m[2][3]);
+#endif
+    // Bip01_Head1 bone X axis (column 0) runs from neck to top of skull (~+2.5u
+    // to center of head hitbox regardless of whether enemy pitch is 0, +89, or -89).
+    Vector axis_x(bones[bone].m[0][0], bones[bone].m[1][0], bones[bone].m[2][0]);
+    float const ax_len = sqrtf(axis_x.x * axis_x.x + axis_x.y * axis_x.y + axis_x.z * axis_x.z);
+    if (ax_len > 0.5f && ax_len < 1.5f) {
+        p = p + axis_x * (2.6f / ax_len);
+    } else {
+        p.z += 2.6f;
+    }
     Vector d = p - origin;
     if (sqrtf(d.x * d.x + d.y * d.y + d.z * d.z) > 130.0f) return false;
     out = p;
@@ -1446,8 +1685,8 @@ void Backtrack_Record(int index, void* entity) {
     ring[head].eye_z = vo.z;
     ring[head].used = true;
 
-    // drop stale entries
-    float const cutoff = now - 0.55f;
+    // drop stale entries beyond sv_maxunlag window
+    float const cutoff = now - 0.22f;
     for (int i = 0; i < 40; i++)
         if (ring[i].used && ring[i].t < cutoff)
             ring[i].used = false;
@@ -1456,12 +1695,16 @@ void Backtrack_Record(int index, void* entity) {
 bool Backtrack_PickRecord(int index, float seconds_ago, Vector& out_origin, float& out_simtime) {
     if (index <= 0 || index > 64) return false;
     float const now = engine.self ? engine.Time() : 0.0f;
-    float const want = now - seconds_ago;
+    float clamped = seconds_ago;
+    if (clamped > 0.20f) clamped = 0.20f;
+    if (clamped < 0.0f) clamped = 0.0f;
+    float const want = now - clamped;
     BtRecord const* ring = g_bt_records[index];
     float best_d = 1e9f;
     bool any = false;
     for (int i = 0; i < 40; i++) {
-        if (!ring[i].used) continue;
+        if (!ring[i].used || ring[i].simtime <= 0.0f) continue;
+        if (now - ring[i].t > 0.20f) continue;
         float const d = fabsf(ring[i].t - want);
         if (d < best_d) {
             best_d = d;
@@ -1502,47 +1745,152 @@ Vector Backtrack_Pick(int index, float seconds_ago, float eye_z) {
     return best + Vector(0.0f, 0.0f, eye_z * 0.72f);
 }
 
-// miss-count resolver: after consecutive misses on a target, shift the aim
-// point sideways, flipping the side every 2 misses (classic miss resolver)
+// Real HvH angle resolver: fixes CS:S v34/x64 fake pitch (fake-down/fake-up/lisp)
+// and brute-forces/locks real yaw relative to at-target BEFORE SetupBones builds
+// enemy bone matrices so the ragebot aims at the real hitbox instead of the fake model.
 struct ResolverState {
     int misses;
     int hits;
-    int side;        // -1 left, +1 right
+    int side;              // -1 left, +1 right (kept for Lua API compatibility)
+    int yaw_stage;         // 0=raw/auto, 1=back(180), 2=left(+90), 3=right(-90), 4=+135, 5=-135
+    int pitch_stage;       // 0=auto/clamped, 1=+89(down), 2=-89(up), 3=0(zero)
+    int locked_yaw_stage;
+    int locked_pitch_stage;
+    bool has_locked;
+    bool dirty;
     float last_flip;
 };
 static ResolverState g_resolver[65] = {};
+
+static float NormAngle180(float a) {
+    if (!(a == a)) return 0.0f;
+    while (a > 180.0f) a -= 360.0f;
+    while (a < -180.0f) a += 360.0f;
+    return a;
+}
 
 void Resolver_OnMiss(int index) {
     if (index <= 0 || index > 64) return;
     ResolverState& r = g_resolver[index];
     r.misses++;
     r.hits = 0;
-    float const now = engine.self ? engine.Time() : 0.0f;
-    if (r.misses % 2 == 0) {
-        r.side = -r.side;
-        r.last_flip = now;
-    }
+    r.has_locked = false;
+    r.yaw_stage = (r.yaw_stage + 1) % 6;
+    if (r.misses >= 2)
+        r.pitch_stage = (r.pitch_stage + 1) % 4;
+    if (r.side == 0) r.side = 1;
+    else             r.side = -r.side;
+    r.dirty = true;
+    r.last_flip = engine.self ? engine.Time() : 0.0f;
 }
 
 void Resolver_OnHit(int index) {
     if (index <= 0 || index > 64) return;
-    g_resolver[index].misses = 0;
-    g_resolver[index].hits++;
+    ResolverState& r = g_resolver[index];
+    r.misses = 0;
+    r.hits++;
+    r.locked_yaw_stage = r.yaw_stage;
+    r.locked_pitch_stage = r.pitch_stage;
+    r.has_locked = true;
 }
 
 int Resolver_Side(int index) {
     if (index <= 0 || index > 64) return 0;
     ResolverState const& r = g_resolver[index];
-    if (r.misses < 2) return 0; // a single miss is normal spread - stay put
-    int const strength = r.misses / 2;
-    int const units = strength > 3 ? 3 : strength; // 1..3 == 8/16/24 units
-    return r.side * units * 8;
+    if (r.misses < 1) return 0;
+    return (r.side == 0) ? 1 : r.side;
+}
+
+int Resolver_Misses(int index) {
+    if (index <= 0 || index > 64) return 0;
+    return g_resolver[index].misses;
 }
 
 bool Resolver_IsResolved(int index) {
     if (index <= 0 || index > 64) return false;
     ResolverState const& r = g_resolver[index];
-    return r.hits > 0 && r.misses == 0;
+    return r.has_locked || (r.hits > 0 && r.misses == 0);
+}
+
+void Resolver_ApplyFrameStage() {
+    if (!cfg.resolver || !IsGameReady()) return;
+    void* local = GetLocalEntity();
+    if (!local) return;
+    int const local_team = *reinterpret_cast<const int*>((const char*)local + off::m_iTeamNum);
+    Vector const local_org = *reinterpret_cast<const Vector*>((const char*)local + off::m_vecOrigin);
+    if (!(local_org.x == local_org.x) || fabsf(local_org.x) > 32768.0f) return;
+
+    constexpr float kRadToDeg = 57.29577951308232f;
+    static const float kYawOffsets[6] = { 0.0f, 180.0f, 90.0f, -90.0f, 135.0f, -135.0f };
+
+    for (int i = 1; i <= 64; i++) {
+        void* ent = entity_list.GetClientEntity(i);
+        if (!ent || ent == local) continue;
+        if (!IsPlayerIndex(i)) continue;
+        if (EntityIsStale(ent, i)) continue;
+        if (*reinterpret_cast<const char*>((const char*)ent + off::m_lifeState) != 0) {
+            g_resolver[i].misses = 0;
+            continue;
+        }
+        if (*reinterpret_cast<const int*>((const char*)ent + off::m_iHealth) <= 0) continue;
+        if (local_team > 0 && *reinterpret_cast<const int*>((const char*)ent + off::m_iTeamNum) == local_team)
+            continue;
+
+        Vector const ent_org = *reinterpret_cast<const Vector*>((const char*)ent + off::m_vecOrigin);
+        if (!(ent_org.x == ent_org.x) || fabsf(ent_org.x) > 32768.0f || fabsf(ent_org.y) > 32768.0f)
+            continue;
+
+        QAngle* eye_ang = reinterpret_cast<QAngle*>((char*)ent + off::m_angEyeAngles);
+        float const raw_p = NormAngle180(eye_ang->x);
+        float const raw_y = NormAngle180(eye_ang->y);
+
+        // On-shot: players cannot fake angles on the tick they fire.
+        if (TargetRecentlyShot(i, 120)) {
+            float p_clamp = raw_p;
+            if (p_clamp > 89.0f) p_clamp = 89.0f;
+            else if (p_clamp < -89.0f) p_clamp = -89.0f;
+            eye_ang->x = p_clamp;
+            eye_ang->y = raw_y;
+            eye_ang->z = 0.0f;
+            continue;
+        }
+
+        ResolverState const& r = g_resolver[i];
+        int const p_stage = r.has_locked ? r.locked_pitch_stage : r.pitch_stage;
+        int const y_stage = r.has_locked ? r.locked_yaw_stage : r.yaw_stage;
+
+        // 1. Pitch resolution: fix CS:S v34 fake-down / fake-up / lisp pitches
+        bool const fake_pitch = (raw_p > 89.0f || raw_p < -89.0f);
+        bool const extreme_pitch = fake_pitch || fabsf(raw_p) > 70.0f || fabsf(raw_p) < 5.0f;
+        float resolved_p = raw_p;
+        if (fake_pitch) {
+            // Lisp / wrapped pitch (>89 or <-89): most v34 cheats wrap +89 (down) or -89 (up)
+            resolved_p = (raw_p > 89.0f) ? 89.0f : -89.0f;
+        }
+        if (extreme_pitch && p_stage > 0) {
+            if (p_stage == 1) resolved_p = 89.0f;
+            else if (p_stage == 2) resolved_p = -89.0f;
+            else resolved_p = 0.0f;
+        } else if (resolved_p > 89.0f) {
+            resolved_p = 89.0f;
+        } else if (resolved_p < -89.0f) {
+            resolved_p = -89.0f;
+        }
+
+        // 2. Yaw resolution: relative to at-target yaw (facing us)
+        float const at_target = atan2f(local_org.y - ent_org.y, local_org.x - ent_org.x) * kRadToDeg;
+        float resolved_y = raw_y;
+        if (y_stage == 0) {
+            // If enemy is clearly using fake pitch, default to backwards (+180)
+            resolved_y = fake_pitch ? NormAngle180(at_target + 180.0f) : raw_y;
+        } else {
+            resolved_y = NormAngle180(at_target + kYawOffsets[y_stage % 6]);
+        }
+
+        eye_ang->x = resolved_p;
+        eye_ang->y = resolved_y;
+        eye_ang->z = 0.0f;
+    }
 }
 
 static char g_flag_buf_money[16];
@@ -1664,8 +2012,23 @@ void DrawESP(ImDrawList* draw, int width, int height) {
             espv.health = std::clamp(health / 100.0f, 0.0f, 1.0f);
             espv.armor = std::clamp(*reinterpret_cast<int*>((char*)entity + off::m_ArmorValue), 0, 100);
 
-            if ((cfg.esp_name || (!alive && g_last_bounds[i].valid)) && esp_info.name[0])
-                espv.name = esp_info.name;
+            static char esp_name_buf[64][64] = {};
+            if ((cfg.esp_name || (!alive && g_last_bounds[i].valid)) && esp_info.name[0]) {
+                if (cfg.esp_cheat_tag) {
+                    const char* short_tag = nullptr;
+                    CheatRevealer_Identify(esp_info.friendsName, esp_info.name, nullptr, &short_tag);
+                    if (!short_tag && i == engine.GetLocalPlayer())
+                        short_tag = "[IW]";
+                    if (short_tag && short_tag[0]) {
+                        snprintf(esp_name_buf[i], sizeof(esp_name_buf[i]), "%s %s", short_tag, esp_info.name);
+                        espv.name = esp_name_buf[i];
+                    } else {
+                        espv.name = esp_info.name;
+                    }
+                } else {
+                    espv.name = esp_info.name;
+                }
+            }
 
             if (cfg.esp_distance) {
                 Vector eye;
@@ -2056,9 +2419,10 @@ void Bones_OnFrameStage() {
     bool const need_bones = cfg.esp_skeleton || cfg.aimbot || cfg.silentaim || cfg.triggerbot;
     if (!IsGameReady() || (!need_bones && !cfg.backtrack))
         return;
+    bool const combat_active = cfg.aimbot || cfg.silentaim || cfg.triggerbot;
     static ULONGLONG s_last_ms = 0;
     ULONGLONG const now_ms = GetTickCount64();
-    if (now_ms - s_last_ms < 16)
+    if (!combat_active && now_ms - s_last_ms < 12)
         return;
     s_last_ms = now_ms;
 
@@ -2082,16 +2446,31 @@ void Bones_OnFrameStage() {
             *reinterpret_cast<const int*>((const char*)entity + off::m_iTeamNum) == local_team)
             continue;
 
+        Vector const ent_org = *reinterpret_cast<const Vector*>((const char*)entity + off::m_vecOrigin);
+        if (!(ent_org.x == ent_org.x) || !(ent_org.y == ent_org.y) || !(ent_org.z == ent_org.z) ||
+            fabsf(ent_org.x) > 32768.0f || fabsf(ent_org.y) > 32768.0f || fabsf(ent_org.z) > 32768.0f)
+            continue;
+
         void* renderable = reinterpret_cast<char*>(entity) + 4;
         EnsureSetupBonesFn(renderable);
         if (!oSetupBones) continue;
 
         BoneCacheEntry& e = g_bone_cache[i];
+        float const simtime = *reinterpret_cast<const float*>((const char*)entity + off::m_flSimulationTime);
+        bool const res_dirty = g_resolver[i].dirty;
+        if (!res_dirty && e.valid && e.renderable == renderable && e.simtime == simtime && (now_ms - e.last_ms) < 30) {
+            e.origin = ent_org;
+            e.frame = g_bone_frame;
+            continue;
+        }
+        g_resolver[i].dirty = false;
         if (oSetupBones(renderable, e.bones, 128, 0x100, cur_time)) {
-            e.origin = *reinterpret_cast<const Vector*>((const char*)entity + off::m_vecOrigin);
+            e.origin = ent_org;
             e.count = 128;
             e.renderable = renderable;
             e.frame = g_bone_frame;
+            e.simtime = simtime;
+            e.last_ms = now_ms;
             e.valid = true;
             GetBoneMap(entity);
         }
